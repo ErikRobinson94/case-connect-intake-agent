@@ -1,5 +1,5 @@
 // index.js
-// Single Render service: Next (from ./web) + WS bridges + WS ping probe.
+// Single Render service: Next (from ./web) + WS bridges (Twilio+Demo) + optional WS ping.
 
 require('dotenv').config();
 
@@ -9,6 +9,7 @@ const express = require('express');
 const morgan = require('morgan');
 const bodyParser = require('body-parser');
 const { createRequire } = require('module');
+const { WebSocketServer } = require('ws');
 
 const { handleTwilioCall } = require('./lib/twilioHandler');
 
@@ -20,12 +21,25 @@ try {
   console.error('[error] Failed to load lib/audio-stream.js:', e?.message || e);
 }
 
-// WS ping probe (sanity check for infra)
+// Optional: WS ping probe (sanity check for infra)
 let setupPing;
 try {
   ({ setupPing } = require('./ws-ping'));
 } catch (e) {
   console.warn('[warn] ws-ping not found; create ws-ping.js if you want a probe route.');
+}
+
+// Optional: browser demo WS handlers
+let attachWebDemoHandlers = null;
+let setupWebDemoLive = null;
+try {
+  const demo = require('./web-demo-live');
+  if (demo) {
+    if (typeof demo.attachWebDemoHandlers === 'function') attachWebDemoHandlers = demo.attachWebDemoHandlers;
+    if (typeof demo.setupWebDemoLive === 'function') setupWebDemoLive = demo.setupWebDemoLive;
+  }
+} catch (e) {
+  console.warn('[warn] require("./web-demo-live") failed:', e?.message || e);
 }
 
 (async () => {
@@ -42,14 +56,14 @@ try {
   // Twilio Voice webhook → returns TwiML that opens the /audio-stream WebSocket
   app.post('/twilio/voice', handleTwilioCall);
 
-  // HTTP server (shared with both WS servers and Next)
+  // HTTP server (shared with WS servers and Next)
   const server = http.createServer(app);
 
-  // ----- Passive visibility log for any WS upgrades (does NOT handle them) -----
-  server.on('upgrade', (req) => {
-    // Just log; do not call handleUpgrade here to avoid double-handling sockets.
+  // ----- Visibility log for any WS upgrades -----
+  server.on('upgrade', (req, _socket, _head) => {
     console.log(
-      `[${new Date().toISOString()}] debug http_upgrade {"path":"${req.url}","listeners":${server.listeners('upgrade').length}}`
+      `[${new Date().toISOString()}] debug http_upgrade ` +
+      JSON.stringify({ path: req.url })
     );
   });
 
@@ -57,7 +71,8 @@ try {
   if (typeof setupAudioStream === 'function') {
     setupAudioStream(server); // uses process.env.AUDIO_STREAM_ROUTE (default /audio-stream)
     console.log(
-      `[${new Date().toISOString()}] info audio_ws_mounted {"route":"${process.env.AUDIO_STREAM_ROUTE || '/audio-stream'}"}`
+      `[${new Date().toISOString()}] info audio_ws_mounted ` +
+      JSON.stringify({ route: process.env.AUDIO_STREAM_ROUTE || '/audio-stream' })
     );
   } else {
     console.error(
@@ -65,35 +80,46 @@ try {
     );
   }
 
-  // ----- Mount WS: Browser demo (exact path; no clashes) -----
-  try {
-    const demo = require('./web-demo-live');
-    const fn =
-      (demo && typeof demo.setupWebDemoLive === 'function' && demo.setupWebDemoLive) ||
-      (typeof demo === 'function' && demo) ||
-      (demo && typeof demo.default === 'function' && demo.default) ||
-      null;
-
-    if (fn) {
-      const demoRoute = '/web-demo/ws';
-      fn(server, { route: demoRoute }); // path-scoped
-      console.log(
-        `[${new Date().toISOString()}] info demo_ws_mounted {"route":"${demoRoute}"}`
-      );
-      // Optional: HTTP GET to WS path returns 426 to clarify misuse in logs
-      app.get(demoRoute, (_req, res) =>
-        res.status(426).send('Upgrade Required: connect via WebSocket.')
-      );
-    } else {
-      console.warn('[warn] web-demo-live export not callable; browser demo WS not mounted.');
-    }
-  } catch (err) {
-    console.warn(`[warn] require("./web-demo-live") failed: ${err?.message || err}`);
-  }
-
   // ----- Mount WS: Ping probe (helps isolate infra vs app issues) -----
   if (typeof setupPing === 'function') {
     setupPing(server, '/ws-ping');
+  }
+
+  // ----- Browser demo WS: manual upgrade routing to avoid path clashes -----
+  const DEMO_ROUTE = '/web-demo/ws';
+
+  // Prefer the newer helper that attaches handlers to an existing WSS.
+  // Fallback to legacy setup if not present.
+  let demoWSS = null;
+  if (attachWebDemoHandlers) {
+    demoWSS = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+    attachWebDemoHandlers(demoWSS);
+
+    server.on('upgrade', (req, socket, head) => {
+      try {
+        const u = new URL(req.url, 'http://localhost');
+        if (u.pathname === DEMO_ROUTE) {
+          return demoWSS.handleUpgrade(req, socket, head, (ws) => {
+            demoWSS.emit('connection', ws, req);
+          });
+        }
+      } catch {}
+      // Do nothing for other paths; their own WS servers will handle them.
+    });
+
+    console.log(
+      `[${new Date().toISOString()}] info demo_ws_mounted ` +
+      JSON.stringify({ route: DEMO_ROUTE, mode: 'manual-upgrade' })
+    );
+  } else if (setupWebDemoLive) {
+    // Legacy path-scoped mount (kept as a fallback)
+    setupWebDemoLive(server, { route: DEMO_ROUTE });
+    console.log(
+      `[${new Date().toISOString()}] info demo_ws_mounted ` +
+      JSON.stringify({ route: DEMO_ROUTE, mode: 'path-scoped' })
+    );
+  } else {
+    console.warn('[warn] web-demo-live export not callable; browser demo WS not mounted.');
   }
 
   // ----- Next.js: load from ./web (no root "next" needed) -----
@@ -134,7 +160,8 @@ try {
   const PORT = parseInt(process.env.PORT, 10) || 10000;
   server.listen(PORT, '0.0.0.0', () => {
     console.log(
-      `[${new Date().toISOString()}] info server_listen {"url":"http://0.0.0.0:${PORT}"}`
+      `[${new Date().toISOString()}] info server_listen ` +
+      JSON.stringify({ url: `http://0.0.0.0:${PORT}` })
     );
   });
 

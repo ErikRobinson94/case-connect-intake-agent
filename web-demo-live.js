@@ -1,18 +1,11 @@
 // web-demo-live.js
-// Browser mic <-> Deepgram Agent bridge (NO Twilio), mounted on the SAME server/port.
-// Exports: setupWebDemoLive(server, { route: '/web-demo/ws' })
-
 require('dotenv').config();
 const WebSocket = require('ws');
 const bus = require('./web-demo-bus'); // optional shared emitter
 
-// ---------- tiny helpers ----------
 function sanitizeASCII(str) {
   if (!str) return '';
-  return String(str)
-    .replace(/[\u0000-\u001F\u007F-\uFFFF]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  return String(str).replace(/[\u0000-\u001F\u007F-\uFFFF]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 function compact(s, max = 380) {
   if (!s) return '';
@@ -21,17 +14,13 @@ function compact(s, max = 380) {
   return 'You are the intake specialist. Determine existing client vs accident. If existing: ask full name, best phone, and attorney; then say you will transfer. If accident: collect full name, phone, email, what happened, when, and city/state; confirm all; then say you will transfer. Be warm, concise, and stop speaking if the caller talks.';
 }
 
-// ---------- main ----------
-function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
-  const wss = new WebSocket.Server({ server, path: route, perMessageDeflate: false });
-
+// --- core wiring, reusable ---
+function attachWebDemoHandlers(wss) {
   wss.on('connection', (browserWS, req) => {
     let closed = false;
-
-    // Let UI know WS is alive
     try { browserWS.send(JSON.stringify({ type: 'status', text: 'demo-ws-connected' })); } catch {}
 
-    // ---- voiceId from query ----
+    // voiceId
     let voiceId = 1;
     try {
       const u = new URL(req.url, 'http://localhost');
@@ -39,13 +28,12 @@ function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
       if ([1, 2, 3].includes(v)) voiceId = v;
     } catch {}
 
-    // map per-avatar TTS from env
     const ttsFromEnv =
       process.env[`VOICE_${voiceId}_TTS`] ||
       process.env.DG_TTS_VOICE ||
       'aura-2-odysseus-en';
 
-    // ---- Deepgram Agent ----
+    // Deepgram Agent
     const dgUrl = process.env.DG_AGENT_URL || 'wss://agent.deepgram.com/v1/agent/converse';
     const dgKey = process.env.DEEPGRAM_API_KEY;
     if (!dgKey) {
@@ -58,7 +46,6 @@ function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
     const llmModel = (process.env.LLM_MODEL || 'gpt-4o-mini').trim();
     const ttsVoice = ttsFromEnv;
 
-    // prompt & greeting (parity with phone bridge)
     const firm      = process.env.FIRM_NAME  || 'Benji Personal Injury';
     const agentName = process.env.AGENT_NAME || 'Alexis';
     const DEFAULT_PROMPT =
@@ -97,7 +84,6 @@ function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
       try {
         agentWS.send(JSON.stringify(settings));
         settingsSent = true;
-        // tell the UI what we applied
         try {
           browserWS.send(JSON.stringify({
             type: 'settings',
@@ -105,7 +91,7 @@ function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
             greeting, prompt_len: prompt.length
           }));
         } catch {}
-      } catch (e) {
+      } catch {
         try { browserWS.send(JSON.stringify({ type: 'status', text: 'Failed to send Settings to Deepgram.' })); } catch {}
       }
     }
@@ -116,14 +102,12 @@ function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
       sendSettings();
     });
 
-    // keepalive
     const keepalive = setInterval(() => {
       if (agentWS.readyState === WebSocket.OPEN) {
         try { agentWS.send(JSON.stringify({ type: 'KeepAlive' })); } catch {}
       }
     }, 25000);
 
-    // small meters
     let meterMicBytes = 0, meterTtsBytes = 0;
     const meter = setInterval(() => {
       if (meterMicBytes || meterTtsBytes) {
@@ -137,17 +121,14 @@ function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
       try { browserWS.send(JSON.stringify(payload)); } catch {}
     }
 
-    // preroll buffer (frames queued before SettingsApplied)
     const preFrames = [];
-    const MAX_PRE_FRAMES = 200; // ~4s @ 20ms frames
+    const MAX_PRE_FRAMES = 200; // ~4s @ 20ms
 
     agentWS.on('message', (data) => {
       const isBuf = Buffer.isBuffer(data);
-      // JSON control / transcripts
       if (!isBuf || (isBuf && data.length && data[0] === 0x7b)) {
         let evt = null; try { evt = JSON.parse(isBuf ? data.toString('utf8') : data); } catch {}
         if (!evt) return;
-
         const role = String((evt.role || evt.speaker || evt.actor || '')).toLowerCase();
         const text = String(evt.content ?? evt.text ?? evt.transcript ?? evt.message ?? '').trim();
         const isFinal = evt.final === true || evt.is_final === true || evt.status === 'final' || evt.type === 'UserResponse';
@@ -156,17 +137,13 @@ function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
           case 'Welcome':
             sendSettings();
             break;
-
           case 'SettingsApplied':
             settingsApplied = true;
-            // flush preroll
             if (preFrames.length) {
               try { for (const fr of preFrames) agentWS.send(fr); } catch {}
               preFrames.length = 0;
             }
             break;
-
-          // Broad set of transcript events
           case 'ConversationText':
           case 'History':
           case 'UserTranscript':
@@ -179,17 +156,12 @@ function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
           case 'PartialTranscript':
           case 'AddPartialTranscript':
             if (!text) break;
-            if (role.includes('agent') || role.includes('assistant')) {
-              forwardTranscript('agent', text, isFinal);
-            } else if (role.includes('user')) {
-              forwardTranscript('user', text, isFinal);
-            }
+            if (role.includes('agent') || role.includes('assistant')) forwardTranscript('agent', text, isFinal);
+            else if (role.includes('user')) forwardTranscript('user', text, isFinal);
             break;
-
           case 'AgentWarning':
             try { browserWS.send(JSON.stringify({ type: 'status', text: `Agent warning: ${evt.message || 'unknown'}` })); } catch {}
             break;
-
           case 'AgentError':
           case 'Error':
             try { browserWS.send(JSON.stringify({ type: 'status', text: `Agent error: ${evt.description || evt.message || 'unknown'}` })); } catch {}
@@ -197,8 +169,7 @@ function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
         }
         return;
       }
-
-      // Binary = DG TTS PCM16 @ 16k → forward to browser
+      // Binary TTS -> browser
       meterTtsBytes += data.length;
       try { browserWS.send(data, { binary: true }); } catch {}
     });
@@ -209,21 +180,16 @@ function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
       bus?.emit('status', 'Web demo Deepgram closed.');
       safeClose();
     });
-
     agentWS.on('error', (e) => {
       try { browserWS.send(JSON.stringify({ type: 'status', text: `Deepgram error: ${e?.message || e}` })); } catch {}
     });
 
-    // ---- Browser mic → DG, 20 ms framing, queue until ready ----
     const FRAME_MS = 20, IN_RATE = 16000, BPS = 2;
     const BYTES_PER_FRAME = Math.round(IN_RATE * BPS * (FRAME_MS / 1000)); // 640
-
     let micBuf = Buffer.alloc(0);
 
     browserWS.on('message', (msg) => {
-      // Ignore JSON control from browser; expect audio frames (ArrayBuffer)
       if (typeof msg === 'string') return;
-
       if (agentWS.readyState !== WebSocket.OPEN) return;
       const buf = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
       meterMicBytes += buf.length;
@@ -251,6 +217,24 @@ function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
       try { browserWS.terminate?.(); } catch {}
     }
   });
+
+  // extra logging to catch handshake issues
+  wss.on('error', (e) => console.error('[demo-ws] server error', e?.message || e));
+  wss.on('headers', (headers, req) => {
+    console.log('[demo-ws] handshake', {
+      path: req.url,
+      upgrade: req.headers.upgrade,
+      version: req.headers['sec-websocket-version'],
+      ua: req.headers['user-agent'],
+    });
+  });
 }
 
-module.exports = { setupWebDemoLive };
+// legacy entrypoint (kept for compatibility)
+function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
+  const wss = new WebSocket.Server({ server, path: route, perMessageDeflate: false });
+  attachWebDemoHandlers(wss);
+  return wss;
+}
+
+module.exports = { setupWebDemoLive, attachWebDemoHandlers };
