@@ -1,5 +1,5 @@
 // index.js
-// Single Render service: Next (from ./web) + WS bridges, with visibility logs.
+// Single Render service: Next (from ./web) + WS bridges.
 
 require('dotenv').config();
 
@@ -35,14 +35,6 @@ try {
 
   // HTTP server (shared with both WS servers and Next)
   const server = http.createServer(app);
-
-  // ----- Passive visibility log for any WS upgrades (does NOT handle them) -----
-  server.on('upgrade', (req) => {
-    // Just log; do not call handleUpgrade here to avoid double-handling sockets
-    console.log(
-      `[${new Date().toISOString()}] debug http_upgrade {"path":"${req.url}","listeners":${server.listeners('upgrade').length}}`
-    );
-  });
 
   // ----- Mount WS: Twilio <-> Deepgram (exact path; no clashes) -----
   if (typeof setupAudioStream === 'function') {
@@ -88,7 +80,7 @@ try {
 
   await nextApp.prepare();
 
-  // Let Next handle everything else (no hard-coded "/" route here)
+  // Let Next handle everything else
   app.all('*', (req, res) => nextHandler(req, res));
 
   // ---------- Boot visibility: summarize important env (mask secrets) ----------
