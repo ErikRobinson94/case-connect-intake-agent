@@ -1,10 +1,14 @@
+// index.js — single-service server for Express + Twilio WS + Deepgram + Next.js (web app)
 require('dotenv').config();
 
 const http = require('http');
+const path = require('path');
 const express = require('express');
 const morgan = require('morgan');
 const bodyParser = require('body-parser');
-const next = require('next');
+
+// Resolve Next from the /web workspace (where it's installed)
+const next = require(require.resolve('next', { paths: [path.join(__dirname, 'web')] }));
 
 const { handleTwilioCall } = require('./lib/twilioHandler');
 
@@ -56,17 +60,17 @@ try {
 }
 
 /* ---------- Next.js app served by the same process ---------- */
-const nextApp = next({ dev: false, dir: './web' }); // uses /web/.next built at deploy time
+const nextApp = next({ dev: false, dir: './web' }); // uses /web/.next built during deploy
 const handle = nextApp.getRequestHandler();
 
 (async () => {
   try {
     await nextApp.prepare();
 
-    // Health endpoint (so root "/" can be handled by Next)
+    // Simple health endpoint (keeps "/" for Next)
     app.get('/healthz', (_req, res) => res.status(200).send('OK'));
 
-    // Let Next handle everything else (pages, assets, /worklets, etc.)
+    // Hand everything else to Next (pages, static assets, worklets, etc.)
     app.all('*', (req, res) => handle(req, res));
 
     const PORT = parseInt(process.env.PORT || '5002', 10);
