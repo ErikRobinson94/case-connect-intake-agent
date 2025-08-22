@@ -1,5 +1,5 @@
-// index.js (drop-in)
-// Single Render service: Next (from ./web) + WS bridges.
+// index.js
+// Single Render service: Next (from ./web) + WS bridges, with visibility logs.
 
 require('dotenv').config();
 
@@ -11,6 +11,7 @@ const bodyParser = require('body-parser');
 const { createRequire } = require('module');
 
 const { handleTwilioCall } = require('./lib/twilioHandler');
+
 let setupAudioStream;
 try {
   ({ setupAudioStream } = require('./lib/audio-stream'));
@@ -21,7 +22,7 @@ try {
 (async () => {
   const app = express();
 
-  // Basic middleware
+  // ---------- Basic middleware ----------
   app.use(morgan(process.env.LOG_FORMAT || 'tiny'));
   app.use(bodyParser.urlencoded({ extended: false })); // Twilio sends urlencoded
   app.use(bodyParser.json());
@@ -35,9 +36,20 @@ try {
   // HTTP server (shared with both WS servers and Next)
   const server = http.createServer(app);
 
+  // ----- Passive visibility log for any WS upgrades (does NOT handle them) -----
+  server.on('upgrade', (req) => {
+    // Just log; do not call handleUpgrade here to avoid double-handling sockets
+    console.log(
+      `[${new Date().toISOString()}] debug http_upgrade {"path":"${req.url}","listeners":${server.listeners('upgrade').length}}`
+    );
+  });
+
   // ----- Mount WS: Twilio <-> Deepgram (exact path; no clashes) -----
   if (typeof setupAudioStream === 'function') {
     setupAudioStream(server); // uses process.env.AUDIO_STREAM_ROUTE (default /audio-stream)
+    console.log(
+      `[${new Date().toISOString()}] info audio_ws_mounted {"route":"${process.env.AUDIO_STREAM_ROUTE || '/audio-stream'}"}`
+    );
   } else {
     console.error(
       '[error] setupAudioStream is not a function. Check lib/audio-stream.js export: module.exports = { setupAudioStream }'
@@ -54,8 +66,11 @@ try {
       null;
 
     if (fn) {
-      fn(server, { route: '/web-demo/ws' }); // path-scoped
-      console.log(`[${new Date().toISOString()}] info demo_ws_mounted {"route":"/web-demo/ws"}`);
+      const demoRoute = '/web-demo/ws';
+      fn(server, { route: demoRoute }); // path-scoped
+      console.log(
+        `[${new Date().toISOString()}] info demo_ws_mounted {"route":"${demoRoute}"}`
+      );
     } else {
       console.warn('[warn] web-demo-live export not callable; browser demo WS not mounted.');
     }
@@ -75,6 +90,28 @@ try {
 
   // Let Next handle everything else (no hard-coded "/" route here)
   app.all('*', (req, res) => nextHandler(req, res));
+
+  // ---------- Boot visibility: summarize important env (mask secrets) ----------
+  const mask = (v) => (v ? v.slice(0, 4) + '…' + v.slice(-4) : '');
+  console.log(
+    `[${new Date().toISOString()}] info boot_env ` +
+      JSON.stringify({
+        PORT: process.env.PORT || 10000,
+        AUDIO_STREAM_ROUTE: process.env.AUDIO_STREAM_ROUTE || '/audio-stream',
+        PUBLIC_WSS_HOST: process.env.PUBLIC_WSS_HOST || null,
+        DG_AGENT_URL: process.env.DG_AGENT_URL || 'wss://agent.deepgram.com/v1/agent/converse',
+        DG_STT_MODEL: process.env.DG_STT_MODEL || 'nova-2',
+        DG_TTS_VOICE: process.env.DG_TTS_VOICE || 'aura-2-thalia-en',
+        LLM_MODEL: process.env.LLM_MODEL || 'gpt-4o-mini',
+        LOG_LEVEL: process.env.LOG_LEVEL || 'info',
+        DEEPGRAM_API_KEY_present: !!process.env.DEEPGRAM_API_KEY,
+        OPENAI_API_KEY_present: !!process.env.OPENAI_API_KEY,
+        keys_preview: {
+          DEEPGRAM: mask(process.env.DEEPGRAM_API_KEY || ''),
+          OPENAI: mask(process.env.OPENAI_API_KEY || ''),
+        },
+      })
+  );
 
   const PORT = parseInt(process.env.PORT, 10) || 10000;
   server.listen(PORT, '0.0.0.0', () => {
