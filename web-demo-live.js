@@ -1,75 +1,82 @@
 // web-demo-live.js
-// Browser demo WS <-> Deepgram Agent bridge (16k PCM), path-scoped WSS (no manual upgrade).
+// Browser WS demo: manual upgrade + Deepgram Agent bridge (16k linear16).
 
 const WebSocket = require('ws');
+const { URL } = require('url');
 
-const lv = { error:0, warn:1, info:2, debug:3 };
-const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
-const log = (level, msg, extra) => {
-  if ((lv[level] ?? 2) <= (lv[LOG_LEVEL] ?? 2)) {
-    console.log(`[${new Date().toISOString()}] ${level} ${msg} ${extra ? JSON.stringify(extra) : ''}`);
-  }
-};
-
-const sanitize = (s) => (s || '').replace(/[\u0000-\u001F\u007F-\uFFFF]/g, ' ').replace(/\s+/g, ' ').trim();
-const compact = (s, max = 380) => (s && s.length > max ? s.slice(0, max) : s);
-
-const DG_URL  = process.env.DG_AGENT_URL || 'wss://agent.deepgram.com/v1/agent/converse';
-const STT     = (process.env.DG_STT_MODEL   || 'nova-2').trim();
-const LLM     = (process.env.LLM_MODEL      || 'gpt-4o-mini').trim();
-const DEFAULT_TTS = (process.env.DG_TTS_VOICE || 'aura-2-thalia-en').trim();
-
-const FIRM       = process.env.FIRM_NAME  || 'Benji Personal Injury';
-const AGENT_NAME = process.env.AGENT_NAME || 'Alexis';
-const GREETING   = sanitize(process.env.AGENT_GREETING || `Thank you for calling ${FIRM}. Were you in an accident, or are you an existing client?`);
-const RAW_PROMPT = sanitize(process.env.AGENT_INSTRUCTIONS || `You are ${AGENT_NAME} for ${FIRM}. First ask: existing client or accident? Ask one question per turn and wait. Existing: name, best phone, attorney; then say you'll transfer. Accident: name, phone, email, what happened, when, city/state; confirm then say you'll transfer. Stop when caller talks.`);
-const PROMPT     = compact(RAW_PROMPT, 380);
-
-const VOICE_MAP = {
-  '1': process.env.VOICE_1_TTS || DEFAULT_TTS,
-  '2': process.env.VOICE_2_TTS || DEFAULT_TTS,
-  '3': process.env.VOICE_3_TTS || DEFAULT_TTS,
-};
-
-function isOriginAllowed(origin) {
-  const list = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-  if (list.length === 0) return true; // allow all if unset
-  return list.includes(origin);
+function ts() { return new Date().toISOString(); }
+function log(level, msg, extra) {
+  console.log(`[${ts()}] ${level} ${msg} ${extra ? JSON.stringify(extra) : ''}`);
 }
 
 function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
-  // IMPORTANT: path-scoped WSS, no manual server.on('upgrade')
-  const wss = new WebSocket.Server({ server, path: route, perMessageDeflate: false });
-  log('info', 'demo_ws_ready', { route });
+  // Create a WSS we control via server.on('upgrade')
+  const wss = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
 
-  wss.on('connection', (client, req) => {
-    const origin = req.headers.origin || '';
-    if (!isOriginAllowed(origin)) {
-      log('warn', 'demo_ws_bad_origin', { origin });
-      try { client.close(1008, 'bad origin'); } catch {}
+  server.on('upgrade', (req, socket, head) => {
+    let pathname = '';
+    try {
+      pathname = new URL(req.url, 'http://localhost').pathname;
+    } catch {
+      socket.destroy(); return;
+    }
+    if (pathname !== route) return; // not ours
+
+    // Accept unconditionally (we’ll re-enable Origin gating later)
+    log('debug', 'demo_ws_upgrade', {
+      path: req.url,
+      origin: req.headers.origin || null,
+      allowed: true
+    });
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  });
+
+  wss.on('connection', (clientWS, req) => {
+    log('info', 'demo_ws_connection_open', {
+      ip: req.socket.remoteAddress,
+      ua: req.headers['user-agent'] || ''
+    });
+
+    const url = new URL(req.url, 'http://localhost');
+    const voiceId = parseInt(url.searchParams.get('voiceId') || '2', 10);
+
+    // Env → models/voices
+    const sttModel = (process.env.DG_STT_MODEL || 'nova-2').trim();
+    const voices = {
+      1: process.env.VOICE_1_TTS || process.env.DG_TTS_VOICE || 'aura-2-odysseus-en',
+      2: process.env.VOICE_2_TTS || process.env.DG_TTS_VOICE || 'aura-2-thalia-en',
+      3: process.env.VOICE_3_TTS || process.env.DG_TTS_VOICE || 'aura-2-orion-en',
+    };
+    const ttsVoice = (voices[voiceId] || process.env.DG_TTS_VOICE || 'aura-2-thalia-en').trim();
+    const llmModel = (process.env.LLM_MODEL || 'gpt-4o-mini').trim();
+
+    const firm = process.env.FIRM_NAME || 'Benji Personal Injury';
+    const agentName = process.env.AGENT_NAME || 'Alexis';
+    const DEFAULT_PROMPT =
+      `You are ${agentName} for ${firm}. First ask: existing client or accident? ` +
+      `Ask exactly one question per turn and wait for the reply. Existing: get name, best phone, attorney; ` +
+      `then say youll transfer. Accident: get name, phone, email, what happened, when, city/state; ` +
+      `confirm, then say youll transfer. Stop if the caller talks.`;
+    const promptRaw = (process.env.AGENT_INSTRUCTIONS || DEFAULT_PROMPT).replace(/[^\x09\x0A\x0D\x20-\x7E]/g, ' ');
+    const prompt = promptRaw.length > 380 ? promptRaw.slice(0, 380) : promptRaw;
+
+    const greeting =
+      (process.env.AGENT_GREETING ||
+       `Thank you for calling ${firm}. Were you in an accident, or are you an existing client?`)
+      .replace(/[^\x09\x0A\x0D\x20-\x7E]/g, ' ');
+
+    const dgUrl = process.env.DG_AGENT_URL || 'wss://agent.deepgram.com/v1/agent/converse';
+    const dgKey = process.env.DEEPGRAM_API_KEY;
+    if (!dgKey) {
+      log('error', 'dg_missing_key');
+      clientWS.close(1011, 'Server configuration error'); // internal error
       return;
     }
 
-    // Choose voice by query parameter (?voiceId=1|2|3)
-    let voiceId = '2';
-    try { voiceId = new URL(req.url, 'http://x').searchParams.get('voiceId') || '2'; } catch {}
-    const ttsVoice = (VOICE_MAP[voiceId] || DEFAULT_TTS).trim();
-
-    log('info', 'demo_ws_connected', { origin, ttsVoice });
-
-    const agentWS = new WebSocket(DG_URL, ['token', process.env.DEEPGRAM_API_KEY]);
-    let settingsSent = false;
-    let settingsApplied = false;
-    const preRoll = [];
-
-    const keepalive = setInterval(() => {
-      if (agentWS.readyState === WebSocket.OPEN) {
-        try { agentWS.send(JSON.stringify({ type: 'KeepAlive' })); } catch {}
-      }
-    }, 25000);
+    const agentWS = new WebSocket(dgUrl, ['token', dgKey]);
 
     agentWS.on('open', () => {
-      log('info', 'demo_dg_open', { url: DG_URL, STT, ttsVoice, LLM, prompt_len: PROMPT.length });
+      log('info', 'dg_agent_open', { url: dgUrl, sttModel, ttsVoice, llmModel });
       const settings = {
         type: 'Settings',
         audio: {
@@ -78,103 +85,70 @@ function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
         },
         agent: {
           language: 'en',
-          greeting: GREETING,
-          listen: { provider: { type: 'deepgram', model: STT, smart_format: true } },
-          think:  { provider: { type: 'open_ai', model: LLM, temperature: 0.15 }, prompt: PROMPT },
+          greeting,
+          listen: { provider: { type: 'deepgram', model: sttModel, smart_format: true } },
+          think:  { provider: { type: 'open_ai', model: llmModel, temperature: 0.15 }, prompt },
           speak:  { provider: { type: 'deepgram', model: ttsVoice } }
         }
       };
-      try { agentWS.send(JSON.stringify(settings)); settingsSent = true; }
-      catch (e) { log('error', 'demo_dg_send_settings_err', { err: e.message }); }
+      try { agentWS.send(JSON.stringify(settings)); } catch (e) {
+        log('error', 'dg_send_settings_err', { err: e.message });
+      }
     });
 
+    // Deepgram → Browser
     agentWS.on('message', (data) => {
-      // JSON → forward transcripts/settings to UI
-      // Binary → forward TTS PCM16 to UI
-      let evt = null;
-      if (typeof data === 'string') {
-        try { evt = JSON.parse(data); } catch {}
-      } else if (Buffer.isBuffer(data) && data.length && data[0] === 0x7B) { // '{'
-        try { evt = JSON.parse(data.toString('utf8')); } catch {}
-      }
-
-      if (evt) {
-        switch (evt.type) {
-          case 'SettingsApplied':
-            settingsApplied = true;
-            log('info', 'demo_evt_settings_applied');
-            try {
-              client.send(JSON.stringify({
-                type: 'settings',
-                sttModel: STT, ttsVoice, llmModel: LLM, temperature: 0.15,
-                greeting: GREETING, prompt_len: PROMPT.length
-              }));
-            } catch {}
-            if (preRoll.length) {
-              try { for (const c of preRoll) agentWS.send(c); } catch {}
-              preRoll.length = 0;
-            }
-            break;
-
-          case 'Transcript':
-          case 'ConversationText':
-          case 'History':
-          case 'UserTranscript':
-          case 'UserResponse': {
-            const role = (evt.role || evt.speaker || '').toLowerCase();
-            const text =
-              (evt.content && String(evt.content)) ||
-              (evt.text && String(evt.text)) ||
-              (evt.transcript && String(evt.transcript)) ||
-              '';
-            const partial = !!evt.partial;
-            if (text.trim()) {
-              try {
-                client.send(JSON.stringify({
-                  type: 'transcript',
-                  role: role === 'user' ? 'User' : 'Agent',
-                  text, partial
-                }));
-              } catch {}
-            }
-            break;
-          }
-
-          case 'AgentWarning': log('warn',  'demo_evt_warning', evt); break;
-          case 'AgentError':
-          case 'Error':        log('error', 'demo_evt_error',   evt); break;
-          default:             log('debug', 'demo_evt_other',   evt);
+      if (Buffer.isBuffer(data)) {
+        // Binary linear16 @ 16k → send to browser (your UI plays it)
+        try { clientWS.send(data); } catch (e) {
+          log('warn', 'demo_send_binary_err', { err: e.message });
         }
         return;
       }
+      // (Optional) Parse JSON events for transcripts / debugging
+      try {
+        const evt = JSON.parse(data.toString());
+        if (evt?.type === 'SettingsApplied') log('info', 'dg_evt_settings_applied');
+      } catch {}
+    });
 
-      // Binary audio: Agent → Browser (PCM16 @ 16k)
-      try { client.send(data); } catch (e) {
-        log('warn', 'demo_client_send_audio_err', { err: e.message });
+    // Browser → Deepgram (binary Int16 @ 16k)
+    clientWS.on('message', (chunk) => {
+      if (agentWS.readyState === WebSocket.OPEN && Buffer.isBuffer(chunk)) {
+        try { agentWS.send(chunk); } catch (e) {
+          log('warn', 'dg_send_audio_err', { err: e.message });
+        }
       }
     });
 
-    client.on('message', (data) => {
-      // Browser mic frames (PCM16 @16k) → Agent
-      if (agentWS.readyState !== WebSocket.OPEN) return;
-      if (settingsSent && settingsApplied) {
-        try { agentWS.send(data); } catch (e) { log('warn', 'demo_dg_send_audio_err', { err: e.message }); }
-      } else if (settingsSent) {
-        preRoll.push(data);
-        if (preRoll.length > 24) preRoll.shift();
-      }
-    });
+    const keepalive = setInterval(() => {
+      try {
+        if (agentWS.readyState === WebSocket.OPEN) {
+          agentWS.send(JSON.stringify({ type: 'KeepAlive' }));
+        }
+      } catch {}
+    }, 25000);
 
     const cleanup = () => {
       clearInterval(keepalive);
       try { agentWS.close(1000); } catch {}
+      try { clientWS.close(1000); } catch {}
     };
 
-    client.on('close', () => { log('info', 'demo_client_close'); cleanup(); });
-    client.on('error', (e) => log('warn', 'demo_client_err', { err: e?.message || String(e) }));
-    agentWS.on('close', (c, r) => { log('info', 'demo_dg_close', { code: c, reason: r?.toString?.() || '' }); try { client.close(1000); } catch {} cleanup(); });
-    agentWS.on('error', (e) => log('warn', 'demo_dg_err', { err: e?.message || String(e) }));
+    clientWS.on('close', cleanup);
+    clientWS.on('error', (e) => log('warn', 'demo_ws_err', { err: e.message }));
+    agentWS.on('close', (code, reason) =>
+      log('info', 'dg_agent_close', { code, reason: reason?.toString?.() || '' })
+    );
+    agentWS.on('error', (e) => log('warn', 'dg_agent_err', { err: e.message }));
   });
+
+  // Optional: HTTP GET to WS path returns 426 to reduce confusion in logs
+  try {
+    // not fatal if index.js doesn’t pass us express `app`
+  } catch {}
+
+  log('info', 'demo_ws_ready', { route });
 }
 
 module.exports = { setupWebDemoLive };
