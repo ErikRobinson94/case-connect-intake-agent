@@ -1,3 +1,4 @@
+// web/app/page.tsx
 "use client";
 
 import { useEffect, useRef, useState } from "react";
@@ -8,21 +9,20 @@ type Msg = { role: "User" | "Agent" | "System"; text: string; id: string };
 type Payload =
   | { type: "transcript"; role: "User" | "Agent"; text: string; partial?: boolean }
   | { type: "status"; text: string }
-  | {
-      type: "settings";
-      sttModel: string;
-      ttsVoice: string;
-      llmModel: string;
-      temperature: number;
-      greeting: string;
-      prompt_len: number;
-    };
+  | { type: "settings"; sttModel: string; ttsVoice: string; llmModel: string; temperature: number; greeting: string; prompt_len: number };
 
 const VOICES: Voice[] = [
   { id: 1, name: "Voice 1", src: "/images/voice-m1.png", scale: "scale-[1.12]" },
   { id: 2, name: "Voice 2", src: "/images/voice-f1.png" },
   { id: 3, name: "Voice 3", src: "/images/voice-m2.png" },
 ];
+
+// Compute WS base at runtime (works locally and on Render)
+function getWSBase(): string {
+  if (typeof window === "undefined") return "";
+  const proto = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${proto}://${window.location.host}/web-demo/ws`;
+}
 
 // resample 16k -> ctx rate
 function resampleFloat(input: Float32Array, inRate: number, outRate: number): Float32Array {
@@ -57,10 +57,7 @@ export default function Home() {
   const endRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => () => stopDemo(), []);
-
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [transcript.length, partialAgent, partialUser]);
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" }); }, [transcript.length, partialAgent, partialUser]);
 
   const addMsg = (role: Msg["role"], text: string) =>
     setTranscript((prev) => [...prev, { role, text, id: crypto.randomUUID() }]);
@@ -69,11 +66,7 @@ export default function Home() {
     if (audioCtxRef.current) return audioCtxRef.current;
     const Ctx = (window as any).AudioContext || (window as any).webkitAudioContext;
     const ctx: AudioContext = new Ctx();
-    if (ctx.state === "suspended") {
-      try {
-        await ctx.resume();
-      } catch {}
-    }
+    if (ctx.state === "suspended") { try { await ctx.resume(); } catch {} }
     audioCtxRef.current = ctx;
     return ctx;
   }
@@ -81,16 +74,11 @@ export default function Home() {
   async function startDemo() {
     try {
       setTranscript([]);
-      setPartialAgent("");
-      setPartialUser("");
+      setPartialAgent(""); setPartialUser("");
       setStatus("connecting");
 
-      // Build WS URL (env override if provided; otherwise same-origin)
-      const base =
-        process.env.NEXT_PUBLIC_WS_BASE ||
-        `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/web-demo/ws`;
-      const wsUrl = `${base}?voiceId=${selected}`;
-
+      // WS — pass avatar choice in query, use dynamic base
+      const wsUrl = `${getWSBase()}?voiceId=${selected}`;
       const ws = new WebSocket(wsUrl);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
@@ -145,7 +133,7 @@ export default function Home() {
         } catch {}
       };
 
-      // Audio
+      // Audio worklets
       const ctx = await ensureAudioContext();
       await ctx.audioWorklet.addModule("/worklets/pcm-processor.js");
       await ctx.audioWorklet.addModule("/worklets/pcm-player.js");
@@ -165,12 +153,11 @@ export default function Home() {
       micWorkletRef.current = micNode;
 
       // keep mic graph connected but silent
-      const silence = ctx.createGain();
-      silence.gain.value = 0;
+      const silence = ctx.createGain(); silence.gain.value = 0;
       micNode.connect(silence).connect(ctx.destination);
 
-      micNode.port.onmessage = (e) => {
-        const arrbuf = e.data as ArrayBuffer;
+      micNode.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
+        const arrbuf = e.data;
         if (ws.readyState === WebSocket.OPEN) ws.send(arrbuf);
       };
 
@@ -181,22 +168,12 @@ export default function Home() {
   }
 
   function stopDemo() {
-    try {
-      wsRef.current?.close();
-    } catch {}
+    try { wsRef.current?.close(); } catch {}
     wsRef.current = null;
-    try {
-      micWorkletRef.current?.port?.close?.();
-    } catch {}
-    try {
-      playerWorkletRef.current?.disconnect();
-    } catch {}
-    try {
-      sourceRef.current?.disconnect();
-    } catch {}
-    try {
-      audioCtxRef.current?.close();
-    } catch {}
+    try { micWorkletRef.current?.port?.close?.(); } catch {}
+    try { playerWorkletRef.current?.disconnect(); } catch {}
+    try { sourceRef.current?.disconnect(); } catch {}
+    try { audioCtxRef.current?.close(); } catch {}
     micWorkletRef.current = null;
     playerWorkletRef.current = null;
     sourceRef.current = null;
@@ -205,7 +182,7 @@ export default function Home() {
   }
 
   return (
-    <main className="min-h-screen w-full px-4 py-10 bg-black text-white">
+    <main className="min-h-screen w-full px-4 py-10">
       <div className="mx-auto w-full max-w-7xl grid grid-cols-1 lg:grid-cols-12 gap-8">
         {/* LEFT */}
         <section className="lg:col-span-8">
