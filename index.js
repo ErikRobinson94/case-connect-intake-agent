@@ -1,5 +1,5 @@
 // index.js
-// Single Render service: Next (from ./web) + WS bridges.
+// Single Render service: Next (from ./web) + WS bridges + WS ping probe.
 
 require('dotenv').config();
 
@@ -12,11 +12,20 @@ const { createRequire } = require('module');
 
 const { handleTwilioCall } = require('./lib/twilioHandler');
 
+// Optional: audio stream bridge (Twilio <-> Deepgram Agent)
 let setupAudioStream;
 try {
   ({ setupAudioStream } = require('./lib/audio-stream'));
 } catch (e) {
   console.error('[error] Failed to load lib/audio-stream.js:', e?.message || e);
+}
+
+// WS ping probe (sanity check for infra)
+let setupPing;
+try {
+  ({ setupPing } = require('./ws-ping'));
+} catch (e) {
+  console.warn('[warn] ws-ping not found; create ws-ping.js if you want a probe route.');
 }
 
 (async () => {
@@ -30,11 +39,19 @@ try {
   // Health endpoint for Render
   app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 
-  // Twilio Voice webhook → TwiML that opens the /audio-stream WebSocket
+  // Twilio Voice webhook → returns TwiML that opens the /audio-stream WebSocket
   app.post('/twilio/voice', handleTwilioCall);
 
   // HTTP server (shared with both WS servers and Next)
   const server = http.createServer(app);
+
+  // ----- Passive visibility log for any WS upgrades (does NOT handle them) -----
+  server.on('upgrade', (req) => {
+    // Just log; do not call handleUpgrade here to avoid double-handling sockets.
+    console.log(
+      `[${new Date().toISOString()}] debug http_upgrade {"path":"${req.url}","listeners":${server.listeners('upgrade').length}}`
+    );
+  });
 
   // ----- Mount WS: Twilio <-> Deepgram (exact path; no clashes) -----
   if (typeof setupAudioStream === 'function') {
@@ -63,11 +80,20 @@ try {
       console.log(
         `[${new Date().toISOString()}] info demo_ws_mounted {"route":"${demoRoute}"}`
       );
+      // Optional: HTTP GET to WS path returns 426 to clarify misuse in logs
+      app.get(demoRoute, (_req, res) =>
+        res.status(426).send('Upgrade Required: connect via WebSocket.')
+      );
     } else {
       console.warn('[warn] web-demo-live export not callable; browser demo WS not mounted.');
     }
   } catch (err) {
     console.warn(`[warn] require("./web-demo-live") failed: ${err?.message || err}`);
+  }
+
+  // ----- Mount WS: Ping probe (helps isolate infra vs app issues) -----
+  if (typeof setupPing === 'function') {
+    setupPing(server, '/ws-ping');
   }
 
   // ----- Next.js: load from ./web (no root "next" needed) -----
@@ -80,7 +106,7 @@ try {
 
   await nextApp.prepare();
 
-  // Let Next handle everything else
+  // Let Next handle everything else (no hard-coded "/" route here)
   app.all('*', (req, res) => nextHandler(req, res));
 
   // ---------- Boot visibility: summarize important env (mask secrets) ----------
