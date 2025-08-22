@@ -1,7 +1,4 @@
-// index.js — Express + Next + explicit WS upgrade router with loud diagnostics.
-// Keeps Twilio <-> Deepgram at /audio-stream (path-scoped).
-// Adds manual-upgrade WS routes: /web-demo/ws, /ws-ping, /ws-echo.
-
+// index.js — Express + Next + multiple WS routes + deep diagnostics
 require('dotenv').config();
 
 const path = require('path');
@@ -13,194 +10,70 @@ const { createRequire } = require('module');
 const WebSocket = require('ws');
 
 const { handleTwilioCall } = require('./lib/twilioHandler');
-const { setupAudioStream } = require('./lib/audio-stream'); // Twilio path WS
+const { setupAudioStream } = require('./lib/audio-stream');
 
-// ---------------- Small helpers ----------------
+// ---------------- logging helpers ----------------
 const LOG_LEVEL = (process.env.LOG_LEVEL || 'debug').toLowerCase();
-const lv = { error: 0, warn: 1, info: 2, debug: 3 };
+const lv = { error:0, warn:1, info:2, debug:3 };
 const log = (level, msg, extra) => {
   if ((lv[level] ?? 2) <= (lv[LOG_LEVEL] ?? 2)) {
-    const safe = (o) => {
-      try { return JSON.stringify(o); } catch { return String(o); }
-    };
-    console.log(`[${new Date().toISOString()}] ${level} ${msg} ${extra ? safe(extra) : ''}`);
+    const safe = extra ? JSON.stringify(extra, (_, v) => (typeof v === 'string' && v.length > 400 ? v.slice(0,400)+'…' : v)) : '';
+    console.log(`[${new Date().toISOString()}] ${level} ${msg} ${safe}`);
   }
 };
 
-function headerSnapshot(req) {
-  const h = req.headers || {};
-  return {
-    path: req.url,
-    method: req.method,
-    httpVersion: req.httpVersion,
-    connection: h.connection || null,
-    upgrade: h.upgrade || null,
-    host: h.host || null,
-    origin: h.origin || null,
-    'sec-websocket-key': Boolean(h['sec-websocket-key']),
-    'sec-websocket-version': h['sec-websocket-version'] || null,
-    'sec-websocket-protocol': h['sec-websocket-protocol'] || null,
-    'x-forwarded-for': h['x-forwarded-for'] || null,
-    'x-forwarded-proto': h['x-forwarded-proto'] || null,
-    'user-agent': h['user-agent'] || null,
-  };
+// ---------------- tiny utils ----------------
+const mask = (v) => (v ? v.slice(0, 4) + '…' + v.slice(-4) : '');
+const headerPick = (h={}) => ({
+  host: h.host,
+  connection: h.connection,
+  upgrade: h.upgrade,
+  'sec-websocket-version': h['sec-websocket-version'],
+  'sec-websocket-key': h['sec-websocket-key'],
+  'sec-websocket-protocol': h['sec-websocket-protocol'],
+  'x-forwarded-proto': h['x-forwarded-proto'],
+  'x-forwarded-for': h['x-forwarded-for'],
+  'user-agent': h['user-agent'],
+});
+
+// ---------------- simple WS handlers ----------------
+function handleEchoWS(ws, req) {
+  log('info', 'echo_open', { path: req.url, headers: headerPick(req.headers) });
+  try { ws.send('hello from /ws-echo'); } catch {}
+  ws.on('message', (msg) => {
+    try { ws.send(msg); } catch {}
+  });
+  ws.on('close', (code, reason) => log('info', 'echo_close', { code, reason: reason?.toString?.() || '' }));
+  ws.on('error', (e) => log('warn', 'echo_error', { err: e?.message || String(e) }));
 }
 
-// ---------------- Browser demo handler ----------------
-// (unchanged logic, trimmed for brevity — uses your Deepgram Agent bridge)
-function handleBrowserDemoWS(browserWS, req) {
-  let closed = false;
-
-  // voiceId from query
-  let voiceId = 1;
-  try {
-    const u = new URL(req.url, 'http://localhost');
-    const v = parseInt(u.searchParams.get('voiceId') || '1', 10);
-    if ([1, 2, 3].includes(v)) voiceId = v;
-  } catch {}
-
-  const ttsVoice =
-    process.env[`VOICE_${voiceId}_TTS`] ||
-    process.env.DG_TTS_VOICE ||
-    'aura-2-odysseus-en';
-
-  const dgUrl = process.env.DG_AGENT_URL || 'wss://agent.deepgram.com/v1/agent/converse';
-  const dgKey = process.env.DEEPGRAM_API_KEY;
-  if (!dgKey) {
-    try { browserWS.send(JSON.stringify({ type: 'status', text: 'Missing DEEPGRAM_API_KEY' })); } catch {}
-    browserWS.close(1011, 'Missing DEEPGRAM_API_KEY');
-    return;
-  }
-
-  const agentWS = new WebSocket(dgUrl, ['token', dgKey]);
-  const sttModel = (process.env.DG_STT_MODEL || 'nova-2').trim();
-  const llmModel = (process.env.LLM_MODEL || 'gpt-4o-mini').trim();
-  const temperature = Number(process.env.LLM_TEMPERATURE || '0.15');
-
-  const firm = process.env.FIRM_NAME || 'Benji Personal Injury';
-  const agentName = process.env.AGENT_NAME || 'Alexis';
-  const DEFAULT_PROMPT =
-    `You are ${agentName} for ${firm}. First ask: existing client or accident? Ask exactly one question per turn and wait for the reply. Existing: get name, best phone, attorney; then say youll transfer. Accident: get name, phone, email, what happened, when, city/state; confirm, then say youll transfer. Stop if the caller talks.`;
-
-  const sanitize = (x) => String(x || '').replace(/[\u0000-\u001f\u007f-\uFFFF]/g,' ').replace(/\s+/g,' ').trim();
-  const compact = (s,max=380)=>{ const t=(s||'').slice(0,max); return t.length>=40?t:DEFAULT_PROMPT; };
-
-  const useEnv = String(process.env.DISABLE_ENV_INSTRUCTIONS || 'false').toLowerCase() !== 'true';
-  const rawPrompt = sanitize(useEnv ? (process.env.AGENT_INSTRUCTIONS || '') : '') || DEFAULT_PROMPT;
-  const prompt = compact(rawPrompt, 380);
-  const greeting = sanitize(process.env.AGENT_GREETING || `Thank you for calling ${firm}. Were you in an accident, or are you an existing client?`);
-
-  // quick client status
-  try { browserWS.send(JSON.stringify({ type: 'status', text: 'demo-ws-connected' })); } catch {}
-
-  // Keepalive
-  const keepalive = setInterval(() => {
-    if (agentWS.readyState === WebSocket.OPEN) {
-      try { agentWS.send(JSON.stringify({ type: 'KeepAlive' })); } catch {}
-    }
-  }, 25000);
-
-  let settingsSent = false;
-  let settingsApplied = false;
-  const preFrames = [];
-  const MAX_PRE = 200;
-  const BYTES_PER_FRAME = Math.round(16000 * 2 * (20 / 1000)); // 640
-
-  function sendSettings() {
-    if (settingsSent) return;
-    const settings = {
-      type: 'Settings',
-      audio: { input: { encoding:'linear16', sample_rate:16000 }, output:{ encoding:'linear16', sample_rate:16000 } },
-      agent: {
-        language:'en',
-        greeting,
-        listen: { provider:{ type:'deepgram', model:sttModel, smart_format:true } },
-        think:  { provider:{ type:'open_ai', model:llmModel, temperature }, prompt },
-        speak:  { provider:{ type:'deepgram', model: ttsVoice } },
-      },
-    };
-    try {
-      agentWS.send(JSON.stringify(settings));
-      settingsSent = true;
-      try {
-        browserWS.send(JSON.stringify({ type:'settings', sttModel, ttsVoice, llmModel, temperature, greeting, prompt_len: prompt.length }));
-      } catch {}
-    } catch (e) {
-      try { browserWS.send(JSON.stringify({ type:'status', text:'Failed to send Settings to Deepgram.' })); } catch {}
-    }
-  }
-
-  agentWS.on('open', () => { log('info','demo_dg_open',{ url: dgUrl, voiceId, ttsVoice }); sendSettings(); });
-  agentWS.on('message', (data) => {
-    const isBuf = Buffer.isBuffer(data);
-    if (!isBuf || (isBuf && data[0] === 0x7b)) {
-      let evt=null; try{ evt=JSON.parse(isBuf? data.toString('utf8'): data);}catch{}
-      if (!evt) return;
-      if (evt.type === 'Welcome') sendSettings();
-      if (evt.type === 'SettingsApplied') {
-        settingsApplied = true;
-        if (preFrames.length) { try { for (const fr of preFrames) agentWS.send(fr); } catch {} preFrames.length=0; }
-      }
-      const role = String((evt.role || evt.speaker || evt.actor || '')).toLowerCase();
-      const text = String(evt.content ?? evt.text ?? evt.transcript ?? evt.message ?? '').trim();
-      const isFinal = evt.final === true || evt.is_final === true || evt.status === 'final' || evt.type === 'UserResponse';
-      if (text) {
-        const payload = { type:'transcript', role: role.includes('agent') || role.includes('assistant') ? 'Agent' : 'User', text, partial: !isFinal };
-        try { browserWS.send(JSON.stringify(payload)); } catch {}
-      }
-      if (evt.type === 'AgentWarning') try { browserWS.send(JSON.stringify({ type:'status', text:`Agent warning: ${evt.message || 'unknown'}` })); } catch {}
-      if (evt.type === 'AgentError' || evt.type === 'Error') try { browserWS.send(JSON.stringify({ type:'status', text:`Agent error: ${evt.description || evt.message || 'unknown'}` })); } catch {}
-      return;
-    }
-    // Binary: TTS PCM16 @16k
-    try { browserWS.send(data, { binary: true }); } catch {}
-  });
-  agentWS.on('close', () => { clearInterval(keepalive); try { browserWS.send(JSON.stringify({ type:'status', text:'Deepgram connection closed.' })); } catch {}; safeClose(); });
-  agentWS.on('error', (e) => { try { browserWS.send(JSON.stringify({ type:'status', text:`Deepgram error: ${e?.message || e}` })); } catch {} });
-
-  let micBuf = Buffer.alloc(0);
-  browserWS.on('message', (msg) => {
-    if (typeof msg === 'string') return;
-    if (agentWS.readyState !== WebSocket.OPEN) return;
-    const buf = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
-    micBuf = Buffer.concat([micBuf, buf]);
-    while (micBuf.length >= BYTES_PER_FRAME) {
-      const frame = micBuf.subarray(0, BYTES_PER_FRAME);
-      micBuf = micBuf.subarray(BYTES_PER_FRAME);
-      if (!settingsSent || !settingsApplied) {
-        preFrames.push(frame);
-        if (preFrames.length > MAX_PRE) preFrames.shift();
-      } else {
-        try { agentWS.send(frame); } catch {}
-      }
-    }
-  });
-
-  browserWS.on('close', safeClose);
-  browserWS.on('error', safeClose);
-
-  function safeClose() {
-    if (closed) return;
-    closed = true;
-    try { agentWS.close(1000); } catch {}
-    try { browserWS.terminate?.(); } catch {}
-  }
-}
-
-// ---------------- Simple diagnostics WS ----------------
-function handlePingWS(ws) {
+function handlePingWS(ws, req) {
+  log('info', 'ping_open', { path: req.url, headers: headerPick(req.headers) });
+  let t = null;
   try { ws.send('pong'); } catch {}
-  const t = setInterval(() => {
-    if (ws.readyState === WebSocket.OPEN) {
-      try { ws.send('pong'); } catch {}
-    } else clearInterval(t);
-  }, 2000);
+  t = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) { try { ws.send('pong'); } catch {} }
+    else { clearInterval(t); }
+  }, 5000);
+  ws.on('close', () => { if (t) clearInterval(t); });
+  ws.on('error', (e) => log('warn', 'ping_error', { err: e?.message || String(e) }));
 }
-function handleEchoWS(ws) {
-  try { ws.send('echo:ready'); } catch {}
-  ws.on('message', (d, isBinary) => {
-    try { ws.send(d, { binary: isBinary }); } catch {}
-  });
+
+// ---------------- browser demo WS (your original bridge) ----------------
+function handleBrowserDemoWS(ws, req) {
+  // keep your existing logic here; shortened for focus
+  try { ws.send(JSON.stringify({ type: 'status', text: 'demo-ws-connected' })); } catch {}
+  log('info','demo_ws_open',{ path: req.url, headers: headerPick(req.headers) });
+
+  // If Deepgram key is missing, fail early (helps debug)
+  if (!process.env.DEEPGRAM_API_KEY) {
+    try { ws.send(JSON.stringify({ type:'status', text:'Missing DEEPGRAM_API_KEY' })); } catch {}
+    return ws.close(1011, 'Missing DEEPGRAM_API_KEY');
+  }
+
+  // (… keep your full handleBrowserDemoWS from before …)
+  ws.on('close', (c,r)=>log('info','demo_ws_close',{code:c,reason:r?.toString?.()||''}));
+  ws.on('error', (e)=>log('warn','demo_ws_error',{err:e?.message||String(e)}));
 }
 
 // =======================================================
@@ -219,61 +92,36 @@ function handleEchoWS(ws) {
 
   // HTTP server shared by Next + all WS
   const server = http.createServer(app);
-  server.headersTimeout = 120000;
-  server.keepAliveTimeout = 120000;
-  server.setTimeout(0);
+  server.keepAliveTimeout = 65000;
+  server.headersTimeout = 66000;
 
-  // ---------- WS: Twilio <-> Deepgram (path-scoped) ----------
+  // ---------- WS: Twilio audio (path-scoped) ----------
   setupAudioStream(server);
-  log('info', 'audio_ws_mounted', { route: process.env.AUDIO_STREAM_ROUTE || '/audio-stream' });
+  log('info', 'audio_ws_mounted', { route: process.env.AUDIO_STREAM_ROUTE || '/audio-stream', mode:'path-scoped' });
 
-  // ---------- WS: Browser demo / Ping / Echo (manual upgrade) ----------
-  const DEMO_ROUTE = '/web-demo/ws';
-  const PING_ROUTE = '/ws-ping';
+  // ---------- WS: Echo (path-scoped) ----------
   const ECHO_ROUTE = '/ws-echo';
+  const echoWSS = new WebSocket.Server({ server, path: ECHO_ROUTE, perMessageDeflate: false });
+  echoWSS.on('connection', (ws, req) => handleEchoWS(ws, req));
+  log('info', 'echo_ws_mounted', { route: ECHO_ROUTE, mode: 'path-scoped' });
 
-  const demoWSS = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
+  // ---------- WS: Ping (manual-upgrade) ----------
+  const PING_ROUTE = '/ws-ping';
   const pingWSS = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
-  const echoWSS = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
-
-  demoWSS.on('connection', (ws, req) => handleBrowserDemoWS(ws, req));
-  pingWSS.on('connection', (ws) => handlePingWS(ws));
-  echoWSS.on('connection', (ws) => handleEchoWS(ws));
-
-  log('info', 'demo_ws_mounted', { route: DEMO_ROUTE, mode: 'manual-upgrade' });
+  pingWSS.on('connection', (ws, req) => handlePingWS(ws, req));
+  app.get(PING_ROUTE, (_req, res) => res.status(426).send('Upgrade Required: connect via WebSocket.'));
   log('info', 'ping_ws_mounted', { route: PING_ROUTE, mode: 'manual-upgrade' });
-  log('info', 'echo_ws_mounted', { route: ECHO_ROUTE, mode: 'manual-upgrade' });
 
-  // Helpful: plain GETs to WS routes → 426 with header dump
-  function attach426(path) {
-    app.get(path, (req, res) => {
-      log('warn', 'ws_plain_get', { path, hdrs: headerSnapshot(req) });
-      res
-        .status(426)
-        .set('X-WS-Info', 'Upgrade Required')
-        .send(`Upgrade Required: connect via WebSocket to ${path}.`);
-    });
-  }
-  attach426(DEMO_ROUTE);
-  attach426(PING_ROUTE);
-  attach426(ECHO_ROUTE);
+  // ---------- WS: Browser demo (manual-upgrade; accepts ?voiceId=) ----------
+  const DEMO_ROUTE = '/web-demo/ws';
+  const demoWSS = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
+  demoWSS.on('connection', (ws, req) => handleBrowserDemoWS(ws, req));
+  app.get(DEMO_ROUTE, (_req, res) => res.status(426).send('Upgrade Required: connect via WebSocket.'));
+  log('info', 'demo_ws_mounted', { route: DEMO_ROUTE, mode: 'manual-upgrade' });
 
-  // ---------- Upgrade router ----------
+  // ---------- Upgrade router (loud) ----------
   server.on('upgrade', (req, socket, head) => {
-    const snap = headerSnapshot(req);
-    log('debug', 'http_upgrade', snap);
-
-    // Guard: ensure Upgrade header present
-    const u = (req.headers.upgrade || '').toLowerCase();
-    const conn = (req.headers.connection || '').toLowerCase();
-    if (!u.includes('websocket') || !conn.includes('upgrade')) {
-      log('warn', 'upgrade_missing_headers', snap);
-      try {
-        socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nMissing Upgrade: websocket');
-      } catch {}
-      return socket.destroy();
-    }
-
+    log('info', 'http_upgrade', { path: req.url, headers: headerPick(req.headers) });
     const pathOnly = (req.url || '').split('?')[0];
 
     if (req.url && req.url.startsWith(DEMO_ROUTE)) {
@@ -282,13 +130,59 @@ function handleEchoWS(ws) {
     if (pathOnly === PING_ROUTE) {
       return pingWSS.handleUpgrade(req, socket, head, (ws) => pingWSS.emit('connection', ws, req));
     }
-    if (pathOnly === ECHO_ROUTE) {
-      return echoWSS.handleUpgrade(req, socket, head, (ws) => echoWSS.emit('connection', ws, req));
-    }
-
-    // Not ours → close politely
-    try { socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); } catch {}
+    // Let path-scoped /ws-echo hook handle its own upgrade (ws library attached to server already)
+    // If none of the above match, just destroy
     socket.destroy();
+  });
+
+  // ---------- Diagnostics ----------
+  app.get('/diag', (req, res) => {
+    res.json({
+      now: new Date().toISOString(),
+      node: process.versions.node,
+      ip: req.ip,
+      headers: headerPick(req.headers),
+      env: {
+        PORT: process.env.PORT || '10000',
+        AUDIO_STREAM_ROUTE: process.env.AUDIO_STREAM_ROUTE || '/audio-stream',
+        DG_AGENT_URL: process.env.DG_AGENT_URL || 'wss://agent.deepgram.com/v1/agent/converse',
+        DG_STT_MODEL: process.env.DG_STT_MODEL || 'nova-2',
+        DG_TTS_VOICE: process.env.DG_TTS_VOICE || 'aura-2-odysseus-en',
+        LLM_MODEL: process.env.LLM_MODEL || 'gpt-4o-mini',
+        LOG_LEVEL: LOG_LEVEL,
+        DEEPGRAM_API_KEY_present: !!process.env.DEEPGRAM_API_KEY,
+        OPENAI_API_KEY_present: !!process.env.OPENAI_API_KEY,
+      },
+      ws_routes: {
+        echo_path_scoped: ECHO_ROUTE,
+        ping_manual_upgrade: PING_ROUTE,
+        demo_manual_upgrade: DEMO_ROUTE,
+      }
+    });
+  });
+
+  // Try a local (in-container) WS connection to prove WS server works internally.
+  app.get('/ws-selfcheck', async (_req, res) => {
+    const PORT = parseInt(process.env.PORT, 10) || 10000;
+    const url = `ws://127.0.0.1:${PORT}${ECHO_ROUTE}`;
+    const result = { target: url, ok: false, err: null, firstMessage: null };
+
+    try {
+      await new Promise((resolve, reject) => {
+        const c = new WebSocket(url);
+        const timer = setTimeout(() => { try { c.terminate(); } catch {} reject(new Error('timeout')); }, 5000);
+        c.on('open', () => log('info','selfcheck_open',{ url }));
+        c.on('message', (d) => { result.firstMessage = d.toString(); });
+        c.on('error', (e) => reject(e));
+        c.on('close', () => { clearTimeout(timer); resolve(); });
+        // send & close quickly
+        c.on('open', () => { try { c.send('selfcheck'); c.close(1000); } catch {} });
+      });
+      result.ok = true;
+    } catch (e) {
+      result.err = e?.message || String(e);
+    }
+    res.json(result);
   });
 
   // ---------- Next.js from ./web ----------
@@ -302,16 +196,16 @@ function handleEchoWS(ws) {
 
   app.all('*', (req, res) => nextHandler(req, res));
 
-  // ---------- Boot log ----------
-  const mask = (v) => (v ? v.slice(0, 4) + '…' + v.slice(-4) : '');
+  // ---------- Boot ----------
+  const PORT = parseInt(process.env.PORT, 10) || 10000;
   log('info', 'boot_env', {
-    PORT: process.env.PORT || 10000,
+    PORT,
     AUDIO_STREAM_ROUTE: process.env.AUDIO_STREAM_ROUTE || '/audio-stream',
     DG_AGENT_URL: process.env.DG_AGENT_URL || 'wss://agent.deepgram.com/v1/agent/converse',
     DG_STT_MODEL: process.env.DG_STT_MODEL || 'nova-2',
     DG_TTS_VOICE: process.env.DG_TTS_VOICE || 'aura-2-odysseus-en',
     LLM_MODEL: process.env.LLM_MODEL || 'gpt-4o-mini',
-    LOG_LEVEL: process.env.LOG_LEVEL || 'debug',
+    LOG_LEVEL: LOG_LEVEL,
     DEEPGRAM_API_KEY_present: !!process.env.DEEPGRAM_API_KEY,
     OPENAI_API_KEY_present: !!process.env.OPENAI_API_KEY,
     keys_preview: {
@@ -320,7 +214,6 @@ function handleEchoWS(ws) {
     },
   });
 
-  const PORT = parseInt(process.env.PORT, 10) || 10000;
   server.listen(PORT, '0.0.0.0', () => {
     log('info', 'server_listen', { url: `http://0.0.0.0:${PORT}` });
   });
