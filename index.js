@@ -4,8 +4,10 @@ const http = require('http');
 const express = require('express');
 const morgan = require('morgan');
 const bodyParser = require('body-parser');
+const next = require('next');
 
 const { handleTwilioCall } = require('./lib/twilioHandler');
+
 let setupAudioStream;
 try {
   ({ setupAudioStream } = require('./lib/audio-stream'));
@@ -14,21 +16,21 @@ try {
 }
 
 const app = express();
+app.set('trust proxy', 1);
 
 /* ---------- middleware ---------- */
-app.set('trust proxy', 1); // Render/Proxies
 app.use(morgan(process.env.LOG_FORMAT || 'tiny'));
 app.use(bodyParser.urlencoded({ extended: false })); // Twilio posts urlencoded
 app.use(bodyParser.json());
 
-/* ---------- routes ---------- */
-app.get('/', (_req, res) => res.status(200).send('OK'));
+/* ---------- Twilio webhook ---------- */
 app.post('/twilio/voice', handleTwilioCall);
 
-/* ---------- Single HTTP server (Render binds one PORT) ---------- */
+/* ---------- Create one HTTP server ---------- */
 const server = http.createServer(app);
 
-// Mount the bidirectional audio WebSocket route (defaults to /audio-stream)
+/* ---------- WebSockets on the SAME server ---------- */
+// 1) Twilio <-> Deepgram bidirectional audio stream (defaults to /audio-stream)
 if (typeof setupAudioStream === 'function') {
   setupAudioStream(server);
 } else {
@@ -37,7 +39,7 @@ if (typeof setupAudioStream === 'function') {
   );
 }
 
-/* ---------- ALSO mount the browser demo WS on the SAME server ---------- */
+// 2) Browser demo WS at /web-demo/ws
 try {
   const { setupWebDemoLive } = require('./web-demo-live');
   if (typeof setupWebDemoLive === 'function') {
@@ -53,12 +55,31 @@ try {
   console.warn(`[warn] require("./web-demo-live") failed: ${err?.message || err}`);
 }
 
-const PORT = parseInt(process.env.PORT || '5002', 10);
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(
-    `[${new Date().toISOString()}] info server_listen {"url":"http://0.0.0.0:${PORT}"}`
-  );
-});
+/* ---------- Next.js app served by the same process ---------- */
+const nextApp = next({ dev: false, dir: './web' }); // uses /web/.next built at deploy time
+const handle = nextApp.getRequestHandler();
+
+(async () => {
+  try {
+    await nextApp.prepare();
+
+    // Health endpoint (so root "/" can be handled by Next)
+    app.get('/healthz', (_req, res) => res.status(200).send('OK'));
+
+    // Let Next handle everything else (pages, assets, /worklets, etc.)
+    app.all('*', (req, res) => handle(req, res));
+
+    const PORT = parseInt(process.env.PORT || '5002', 10);
+    server.listen(PORT, '0.0.0.0', () => {
+      console.log(
+        `[${new Date().toISOString()}] info server_listen {"url":"http://0.0.0.0:${PORT}"}`
+      );
+    });
+  } catch (err) {
+    console.error('[error] next_prepare_failed', err?.message || err);
+    process.exit(1);
+  }
+})();
 
 /* ---------- harden process ---------- */
 process.on('unhandledRejection', (r) =>
