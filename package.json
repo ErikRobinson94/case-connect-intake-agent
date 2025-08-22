@@ -1,0 +1,23 @@
+{
+  "name": "alexis-ai",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "node index.js"
+  },
+  "dependencies": {
+    "@deepgram/sdk": "^3.13.0",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "axios": "^1.4.0",
+    "body-parser": "^2.2.0",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "morgan": "^1.10.1",
+    "node-fetch": "^2.6.1",
+    "openai": "^5.12.2",
+    "twilio": "^5.8.0",
+    "uuid": "^11.1.0",
+    "ws": "^8.18.3"
+  }
+}
