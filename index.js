@@ -1,7 +1,7 @@
-// index.js — One service on Render: Express + Next (./web) + WS routes
-// - Twilio <-> Deepgram on /audio-stream (path-scoped, unchanged)
-// - Browser demo on /web-demo/ws (manual upgrade so ?voiceId=2 works)
-// - WS ping on /ws-ping (manual upgrade)
+// index.js — Express + Next (./web) + WS routes (path-scoped)
+// - Twilio <-> Deepgram on /audio-stream  (path-scoped; unchanged)
+// - Browser demo on /web-demo/ws          (path-scoped)
+// - WS ping on /ws-ping                   (path-scoped)
 
 require('dotenv').config();
 
@@ -46,11 +46,11 @@ const compact = (s, max = 380) => {
 function handleBrowserDemoWS(browserWS, req) {
   let closed = false;
 
-  // --- Parse voiceId from query (works because we used manual upgrade) ---
+  // --- Parse voiceId from query (accept voiceId or voiceID) ---
   let voiceId = 1;
   try {
     const u = new URL(req.url, 'http://localhost');
-    const v = parseInt(u.searchParams.get('voiceId') || '1', 10);
+    const v = parseInt(u.searchParams.get('voiceId') || u.searchParams.get('voiceID') || '1', 10);
     if ([1, 2, 3].includes(v)) voiceId = v;
   } catch {}
 
@@ -299,43 +299,42 @@ function handlePingWS(ws) {
   setupAudioStream(server);
   log('info', 'audio_ws_mounted', { route: process.env.AUDIO_STREAM_ROUTE || '/audio-stream' });
 
-  // ---------- WS: Browser demo (manual upgrade; accepts ?voiceId=) ----------
+  // ---------- WS: Browser demo (path-scoped; accepts ?voiceId=) ----------
   const DEMO_ROUTE = '/web-demo/ws';
-  const demoWSS = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
-
-  demoWSS.on('connection', (ws, req) => handleBrowserDemoWS(ws, req));
-  log('info', 'demo_ws_mounted', { route: DEMO_ROUTE, mode: 'manual-upgrade' });
+  const demoWSS = new WebSocket.Server({ server, path: DEMO_ROUTE, perMessageDeflate: false });
+  demoWSS.on('connection', (ws, req) => {
+    log('info', 'demo_ws_connection', { path: req.url });
+    handleBrowserDemoWS(ws, req);
+  });
+  demoWSS.on('headers', (_headers, req) => {
+    log('info', 'demo_ws_handshake', {
+      path: req.url,
+      upgrade: req.headers.upgrade,
+      version: req.headers['sec-websocket-version'],
+      ua: req.headers['user-agent'],
+    });
+  });
+  log('info', 'demo_ws_mounted', { route: DEMO_ROUTE, mode: 'path-scoped' });
 
   // Optional: plain HTTP GET to WS path returns 426 to clarify misuse
   app.get(DEMO_ROUTE, (_req, res) => res.status(426).send('Upgrade Required: connect via WebSocket.'));
 
-  // ---------- WS: Ping (manual upgrade) ----------
+  // ---------- WS: Ping (path-scoped) ----------
   const PING_ROUTE = '/ws-ping';
-  const pingWSS = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
-  pingWSS.on('connection', (ws) => handlePingWS(ws));
-  log('info', 'ping_ws_mounted', { route: PING_ROUTE });
-
-  // ---------- Upgrade router ----------
-  server.on('upgrade', (req, socket, head) => {
-    log('debug', 'http_upgrade', { path: req.url });
-
-    // Route: /web-demo/ws (allow querystring)
-    if (req.url && req.url.startsWith(DEMO_ROUTE)) {
-      return demoWSS.handleUpgrade(req, socket, head, (ws) => {
-        demoWSS.emit('connection', ws, req);
-      });
-    }
-
-    // Route: /ws-ping (no query expected, but be lenient)
-    if (req.url && req.url.split('?')[0] === PING_ROUTE) {
-      return pingWSS.handleUpgrade(req, socket, head, (ws) => {
-        pingWSS.emit('connection', ws, req);
-      });
-    }
-
-    // Not ours → let Next/Express handle or close politely
-    socket.destroy();
+  const pingWSS = new WebSocket.Server({ server, path: PING_ROUTE, perMessageDeflate: false });
+  pingWSS.on('connection', (ws, req) => {
+    log('info', 'ping_ws_connection', { path: req.url });
+    handlePingWS(ws);
   });
+  pingWSS.on('headers', (_headers, req) => {
+    log('info', 'ping_ws_handshake', {
+      path: req.url,
+      upgrade: req.headers.upgrade,
+      version: req.headers['sec-websocket-version'],
+      ua: req.headers['user-agent'],
+    });
+  });
+  log('info', 'ping_ws_mounted', { route: PING_ROUTE, mode: 'path-scoped' });
 
   // ---------- Next.js from ./web ----------
   const webDir = path.join(__dirname, 'web');
