@@ -1,97 +1,78 @@
-// public/worklets/pcm-processor.js
-// Resample mic to 16k mono Float32, chunk into 20ms (320 samples), convert to Int16LE,
-// and post ArrayBuffers to the main thread.
-
+// AudioWorkletProcessor that:
+// - reads mic float32 frames at the AudioContext sampleRate
+// - resamples to 16 kHz mono
+// - packs into PCM16 20ms frames (320 samples = 640 bytes)
+// - posts ArrayBuffers to the main thread
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.inRate = sampleRate;           // input device rate (often 48000)
-    this.outRate = 16000;               // target
+    this.inRate = sampleRate;       // AudioContext rate (e.g., 48k)
+    this.outRate = 16000;           // Deepgram expects 16k for the web demo
     this.ratio = this.inRate / this.outRate;
-
-    // Resampling state
-    this.srcCursor = 0;                 // fractional position into this.inBuf
-    this.inBuf = new Float32Array(0);   // accumulated input
-    this.hold = new Float32Array(0);    // leftover resampled floats not yet framed
+    this.inBuf = [];                // JS array of floats (append-only, then slice)
+    this.pos = 0;                   // fractional read position into inBuf
+    this.outFloat = [];             // floats after resample, before framing
   }
 
-  // Linear resample a chunk from this.inBuf into 16k space
-  _resampleAvailable() {
-    const availableSrc = this.inBuf.length - 1; // need +1 for linear interp
-    if (availableSrc <= 0) return new Float32Array(0);
+  _resampleBlock(input) {
+    // Append input floats
+    for (let i = 0; i < input.length; i++) this.inBuf.push(input[i]);
 
-    const maxOut = Math.floor((availableSrc - this.srcCursor) / this.ratio);
-    if (maxOut <= 0) return new Float32Array(0);
-
-    const out = new Float32Array(maxOut);
-    let pos = this.srcCursor;
-
-    for (let i = 0; i < maxOut; i++) {
-      const idx = Math.floor(pos);
-      const frac = pos - idx;
-      const s0 = this.inBuf[idx] ?? 0;
-      const s1 = this.inBuf[idx + 1] ?? s0;
-      out[i] = s0 + (s1 - s0) * frac;
-      pos += this.ratio;
+    // Produce as many 16k samples as we can using linear interpolation
+    const out = [];
+    while (this.pos + 1 < this.inBuf.length) {
+      const i = Math.floor(this.pos);
+      const frac = this.pos - i;
+      const s0 = this.inBuf[i];
+      const s1 = this.inBuf[i + 1];
+      out.push(s0 + (s1 - s0) * frac);
+      this.pos += this.ratio;
     }
 
-    this.srcCursor = pos;
-
-    // Drop consumed source to keep memory bounded
-    const drop = Math.floor(this.srcCursor);
-    if (drop > 0) {
-      this.inBuf = this.inBuf.subarray(drop);
-      this.srcCursor -= drop;
+    // Drop fully-consumed input samples
+    const consumed = Math.floor(this.pos);
+    if (consumed > 0) {
+      this.inBuf = this.inBuf.slice(consumed);
+      this.pos -= consumed;
     }
-
     return out;
   }
 
-  _floatToInt16Buffer(f32) {
-    const out = new Int16Array(f32.length);
-    for (let i = 0; i < f32.length; i++) {
-      const s = Math.max(-1, Math.min(1, f32[i]));
-      out[i] = (s < 0 ? s * 0x8000 : s * 0x7fff) | 0;
+  _flushFrames() {
+    // Frame size: 20ms @16k = 320 samples
+    const FRAME_SAMPLES = 320;
+    while (this.outFloat.length >= FRAME_SAMPLES) {
+      const frame = this.outFloat.splice(0, FRAME_SAMPLES);
+      const pcm16 = new Int16Array(FRAME_SAMPLES);
+      for (let i = 0; i < FRAME_SAMPLES; i++) {
+        let v = frame[i];
+        if (v > 1) v = 1;
+        else if (v < -1) v = -1;
+        pcm16[i] = (v < 0 ? v * 0x8000 : v * 0x7fff) | 0;
+      }
+      // Transfer the underlying buffer to main thread (zero-copy)
+      this.port.postMessage(pcm16.buffer, [pcm16.buffer]);
     }
-    return out.buffer; // ArrayBuffer (transferable)
   }
 
-  process(inputs) {
+  process(inputs, outputs) {
+    // We only need the first input channel (mono)
     const input = inputs[0];
-    const ch = input && input[0] ? input[0] : null;
-    if (!ch) return true;
-
-    // Append latest mic samples
-    const merged = new Float32Array(this.inBuf.length + ch.length);
-    merged.set(this.inBuf, 0);
-    merged.set(ch, this.inBuf.length);
-    this.inBuf = merged;
-
-    // Resample whatever we can to 16k
-    const resampled = this._resampleAvailable();
-    if (resampled.length) {
-      // Combine with any leftover to form frames of 320 samples (20ms @ 16k)
-      const comb = new Float32Array(this.hold.length + resampled.length);
-      comb.set(this.hold, 0);
-      comb.set(resampled, this.hold.length);
-
-      const FRAME_SAMPLES = 320;
-      const fullFrames = Math.floor(comb.length / FRAME_SAMPLES);
-      const toSend = fullFrames * FRAME_SAMPLES;
-
-      if (toSend > 0) {
-        const payload = comb.subarray(0, toSend);     // Float32
-        const int16buf = this._floatToInt16Buffer(payload);
-        // Transfer the ArrayBuffer to main thread (zero-copy)
-        this.port.postMessage(int16buf, [int16buf]);
+    if (input && input[0] && input[0].length) {
+      const inBlock = input[0];
+      const outBlock = this._resampleBlock(inBlock);
+      if (outBlock.length) {
+        // append to outFloat buffer
+        for (let i = 0; i < outBlock.length; i++) this.outFloat.push(outBlock[i]);
+        this._flushFrames();
       }
-
-      // Keep remainder for next call
-      this.hold = comb.subarray(toSend);
     }
-
-    return true; // keep alive
+    // We don’t output audio; keep the node silent in the graph
+    if (outputs && outputs[0] && outputs[0][0]) {
+      outputs[0][0].fill(0);
+    }
+    return true;
   }
 }
 
-registerProcessor("pcm-processor", PCMProcessor);
+registerProcessor('pcm-processor', PCMProcessor);

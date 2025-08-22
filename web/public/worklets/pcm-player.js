@@ -1,43 +1,40 @@
-// public/worklets/pcm-player.js
-// Streams Float32 mono audio smoothly using a simple queue.
-
+// AudioWorkletProcessor that plays Float32 PCM chunks pushed from main thread.
+// The main thread sends Float32Array buffers already at the AudioContext rate.
 class PCMPlayer extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.queue = [];
-    this.offset = 0;
-
-    // Main thread sends ArrayBuffer containing Float32 samples
+    this.queue = [];       // array of Float32Array chunks
+    this.readIndex = 0;    // index into the first chunk
     this.port.onmessage = (e) => {
-      const chunk = new Float32Array(e.data);
-      if (chunk && chunk.length) this.queue.push(chunk);
+      const buf = e.data;
+      if (buf instanceof ArrayBuffer) {
+        const f32 = new Float32Array(buf);
+        if (f32.length) this.queue.push(f32);
+      }
     };
   }
 
-  process(_inputs, outputs) {
-    const out = outputs[0][0]; // mono
-    let i = 0;
+  process(inputs, outputs) {
+    const output = outputs[0];
+    if (!output || !output[0]) return true;
+    const out = output[0];              // mono
+    const frames = out.length;
 
-    while (i < out.length) {
-      if (this.queue.length === 0) {
-        // underrun: fill with silence
+    let i = 0;
+    while (i < frames) {
+      if (!this.queue.length) {
+        // underrun -> fill silence
         out[i++] = 0;
         continue;
       }
-      const cur = this.queue[0];
-      const remaining = cur.length - this.offset;
-      const toCopy = Math.min(remaining, out.length - i);
-
-      out.set(cur.subarray(this.offset, this.offset + toCopy), i);
-      i += toCopy;
-      this.offset += toCopy;
-
-      if (this.offset >= cur.length) {
+      const chunk = this.queue[0];
+      out[i++] = chunk[this.readIndex++];
+      if (this.readIndex >= chunk.length) {
         this.queue.shift();
-        this.offset = 0;
+        this.readIndex = 0;
       }
     }
-    return true; // keep alive
+    return true;
   }
 }
 
