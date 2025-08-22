@@ -1,94 +1,100 @@
-// index.js — single-service server for Express + Twilio WS + Deepgram + Next.js (web app)
+// index.js
 require('dotenv').config();
 
-const http = require('http');
 const path = require('path');
+const http = require('http');
 const express = require('express');
 const morgan = require('morgan');
 const bodyParser = require('body-parser');
+const next = require('next');
 
-// Resolve Next from the /web workspace (where it's installed)
-const next = require(require.resolve('next', { paths: [path.join(__dirname, 'web')] }));
-
+// Twilio webhook -> TwiML <Connect><Stream>
 const { handleTwilioCall } = require('./lib/twilioHandler');
+// Twilio <-> Deepgram agent bridge (WS), path-scoped to /audio-stream
+const { setupBidiBridge } = require('./lib/twilio-deepgram-agent-bridge');
+// Browser demo WS (microphone <-> Deepgram agent), path-scoped to /web-demo/ws
+const { setupWebDemoLive } = require('./web-demo-live');
 
-let setupAudioStream;
-try {
-  ({ setupAudioStream } = require('./lib/audio-stream'));
-} catch (e) {
-  console.error('[error] Failed to load lib/audio-stream.js:', e?.message || e);
-}
+const PORT = parseInt(process.env.PORT || '10000', 10);
+const AUDIO_STREAM_ROUTE = process.env.AUDIO_STREAM_ROUTE || '/audio-stream';
+const DEMO_WS_ROUTE = '/web-demo/ws';
 
-const app = express();
-app.set('trust proxy', 1);
+// --- Next.js app (serves ./web/.next in production) ---
+const nextApp = next({ dev: false, dir: path.join(__dirname, 'web') });
+const handle = nextApp.getRequestHandler();
 
-/* ---------- middleware ---------- */
-app.use(morgan(process.env.LOG_FORMAT || 'tiny'));
-app.use(bodyParser.urlencoded({ extended: false })); // Twilio posts urlencoded
-app.use(bodyParser.json());
+async function main() {
+  await nextApp.prepare();
 
-/* ---------- Twilio webhook ---------- */
-app.post('/twilio/voice', handleTwilioCall);
+  const app = express();
 
-/* ---------- Create one HTTP server ---------- */
-const server = http.createServer(app);
+  // Basic middleware
+  app.use(morgan(process.env.LOG_FORMAT || 'tiny'));
+  app.use(bodyParser.urlencoded({ extended: false }));
+  app.use(bodyParser.json());
 
-/* ---------- WebSockets on the SAME server ---------- */
-// 1) Twilio <-> Deepgram bidirectional audio stream (defaults to /audio-stream)
-if (typeof setupAudioStream === 'function') {
-  setupAudioStream(server);
-} else {
-  console.error(
-    '[error] setupAudioStream is not a function. Check lib/audio-stream.js export: module.exports = { setupAudioStream }'
+  // Static worklets for the browser demo
+  app.use(
+    '/worklets',
+    express.static(path.join(__dirname, 'public', 'worklets'), {
+      immutable: true,
+      maxAge: '1y',
+    })
+  );
+
+  // Health
+  app.get('/healthz', (_req, res) => res.status(200).send('OK'));
+
+  // Twilio webhook -> returns TwiML to open the media stream to our WS
+  app.post('/twilio/voice', handleTwilioCall);
+
+  // Let Next.js handle everything else (pages, assets)
+  app.all('*', (req, res) => handle(req, res));
+
+  // One HTTP server for everything
+  const server = http.createServer(app);
+
+  // Mount WS: Twilio media bridge (path-scoped so it won't collide)
+  setupBidiBridge(server, { route: AUDIO_STREAM_ROUTE });
+
+  // Mount WS: Browser demo (same HTTP server, different path)
+  setupWebDemoLive(server, { route: DEMO_WS_ROUTE });
+  console.log(
+    `[${new Date().toISOString()}] info demo_ws_mounted ${JSON.stringify({
+      route: DEMO_WS_ROUTE,
+    })}`
+  );
+
+  // Optional: tiny upgrade logger (helps if anything else swallows upgrades)
+  server.on('upgrade', (req) => {
+    try {
+      const u = new URL(req.url, `http://${req.headers.host}`);
+      console.log(
+        `[${new Date().toISOString()}] debug http_upgrade ${JSON.stringify({
+          path: u.pathname,
+        })}`
+      );
+    } catch {}
+  });
+
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(
+      `[${new Date().toISOString()}] info server_listen ${JSON.stringify({
+        url: `http://0.0.0.0:${PORT}`,
+      })}`
+    );
+  });
+
+  // Safety
+  process.on('unhandledRejection', (r) =>
+    console.warn('[warn] unhandledRejection', r?.message || r)
+  );
+  process.on('uncaughtException', (e) =>
+    console.error('[error] uncaughtException', e?.message || e)
   );
 }
 
-// 2) Browser demo WS at /web-demo/ws
-try {
-  const { setupWebDemoLive } = require('./web-demo-live');
-  if (typeof setupWebDemoLive === 'function') {
-    const demoRoute = '/web-demo/ws';
-    setupWebDemoLive(server, { route: demoRoute });
-    console.log(
-      `[${new Date().toISOString()}] info demo_ws_mounted {"route":"${demoRoute}"}`
-    );
-  } else {
-    console.warn('[warn] web-demo-live did not export setupWebDemoLive(server, {route})');
-  }
-} catch (err) {
-  console.warn(`[warn] require("./web-demo-live") failed: ${err?.message || err}`);
-}
-
-/* ---------- Next.js app served by the same process ---------- */
-const nextApp = next({ dev: false, dir: './web' }); // uses /web/.next built during deploy
-const handle = nextApp.getRequestHandler();
-
-(async () => {
-  try {
-    await nextApp.prepare();
-
-    // Simple health endpoint (keeps "/" for Next)
-    app.get('/healthz', (_req, res) => res.status(200).send('OK'));
-
-    // Hand everything else to Next (pages, static assets, worklets, etc.)
-    app.all('*', (req, res) => handle(req, res));
-
-    const PORT = parseInt(process.env.PORT || '5002', 10);
-    server.listen(PORT, '0.0.0.0', () => {
-      console.log(
-        `[${new Date().toISOString()}] info server_listen {"url":"http://0.0.0.0:${PORT}"}`
-      );
-    });
-  } catch (err) {
-    console.error('[error] next_prepare_failed', err?.message || err);
-    process.exit(1);
-  }
-})();
-
-/* ---------- harden process ---------- */
-process.on('unhandledRejection', (r) =>
-  console.warn('[warn] unhandledRejection', r?.message || r)
-);
-process.on('uncaughtException', (e) =>
-  console.error('[error] uncaughtException', e?.message || e)
-);
+main().catch((e) => {
+  console.error('[fatal] boot_failed', e?.stack || e?.message || e);
+  process.exit(1);
+});
