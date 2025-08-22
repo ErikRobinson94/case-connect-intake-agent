@@ -2,86 +2,105 @@
 require('dotenv').config();
 
 const path = require('path');
+const fs = require('fs');
 const http = require('http');
 const express = require('express');
 const morgan = require('morgan');
 const bodyParser = require('body-parser');
 
-// Twilio webhook + WS audio bridge
 const { handleTwilioCall } = require('./lib/twilioHandler');
-const { setupAudioStream } = require('./lib/audio-stream');
+const { createWebDemoWSS } = require('./web-demo-live');
 
-// Web demo WS (browser mic <-> Deepgram Agent)
-const { setupWebDemoLive } = require('./web-demo-live');
+let setupAudioStream;
+try {
+  ({ setupAudioStream } = require('./lib/audio-stream'));
+} catch (e) {
+  console.error('[error] Failed to load lib/audio-stream.js:', e?.message || e);
+}
 
-// --- Resolve Next *from the /web app* without installing it at the repo root
-const next = require(path.join(__dirname, 'web', 'node_modules', 'next'));
+const app = express();
 
-(async () => {
-  const PORT = parseInt(process.env.PORT || '10000', 10);
+/* ---------- middleware ---------- */
+app.use(morgan(process.env.LOG_FORMAT || 'tiny'));
+app.use(bodyParser.urlencoded({ extended: false })); // Twilio posts urlencoded
+app.use(bodyParser.json());
 
-  // ----------------- Next app (serves your /web UI) -----------------
-  const nextApp = next({
-    dir: path.join(__dirname, 'web'), // Next project lives in ./web
-    dev: false,
-  });
-  const handle = nextApp.getRequestHandler();
-  await nextApp.prepare();
+/* ---------- routes ---------- */
+app.get('/healthz', (_req, res) => res.status(200).send('OK'));
+app.get('/', (_req, res) => sendIndex(res));
+app.post('/twilio/voice', handleTwilioCall);
 
-  // ----------------- Express app (REST + Twilio) -----------------
-  const app = express();
+/* ---------- static: serve prebuilt Next app from /web ---------- */
+const WEB_DIR = path.join(__dirname, 'web');
+const NEXT_OUT = path.join(WEB_DIR, '.next');
+const PUBLIC_DIR = path.join(WEB_DIR, 'public');
 
-  // middleware
-  app.use(morgan(process.env.LOG_FORMAT || 'tiny'));
-  app.use(bodyParser.urlencoded({ extended: false })); // Twilio posts urlencoded
-  app.use(bodyParser.json());
+// _next static assets
+app.use('/_next', express.static(path.join(NEXT_OUT, 'static'), { maxAge: '1y', immutable: true }));
 
-  // health
-  app.get('/healthz', (_req, res) => res.status(200).send('ok'));
+// public assets (images, worklets, etc.)
+if (fs.existsSync(PUBLIC_DIR)) {
+  app.use(express.static(PUBLIC_DIR, { maxAge: '7d' }));
+}
 
-  // Twilio webhook
-  app.post('/twilio/voice', handleTwilioCall);
+function sendIndex(res) {
+  const html = path.join(NEXT_OUT, 'server', 'app', 'index.html');
+  const fallback = path.join(WEB_DIR, 'app', 'index.html'); // in case of alternative layouts
+  const file = fs.existsSync(html) ? html : fallback;
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  fs.createReadStream(file).pipe(res);
+}
 
-  // Serve the AudioWorklets for the browser demo
-  app.use(
-    '/worklets',
-    express.static(path.join(__dirname, 'web', 'public', 'worklets'), {
-      maxAge: '1h',
-      immutable: true,
-    })
+/* ---------- HTTP server ---------- */
+const server = http.createServer(app);
+
+/* ---------- WebSocket: Twilio <-> Deepgram bridge on /audio-stream ---------- */
+if (typeof setupAudioStream === 'function') {
+  setupAudioStream(server); // this module mounts its own WSS (path: /audio-stream)
+} else {
+  console.error(
+    '[error] setupAudioStream is not a function. Check lib/audio-stream.js export: module.exports = { setupAudioStream }'
   );
+}
 
-  // All remaining routes → Next (serves your UI from /web)
-  app.all('*', (req, res) => handle(req, res));
+/* ---------- WebSocket: Browser demo on /web-demo/ws (noServer+router) ---------- */
+const WEB_DEMO_ROUTE = '/web-demo/ws';
+const webDemoWSS = createWebDemoWSS();
 
-  // ----------------- Single shared HTTP server -----------------
-  const server = http.createServer(app);
+// Single upgrade router → avoids “handleUpgrade more than once” and accepts query strings
+server.on('upgrade', (req, socket, head) => {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const pathname = url.pathname;
+    // optional: observe forwarded host if you want to restrict by host
+    // const xfHost = req.headers['x-forwarded-host'] || req.headers.host;
 
-  // Attach the WS bridges by path (no manual server.on('upgrade')!)
-  // 1) Twilio <Connect><Stream> ↔ Deepgram
-  setupAudioStream(server); // uses process.env.AUDIO_STREAM_ROUTE (defaults /audio-stream)
+    if (pathname === WEB_DEMO_ROUTE) {
+      webDemoWSS.handleUpgrade(req, socket, head, (ws) => {
+        webDemoWSS.emit('connection', ws, req);
+      });
+    } else {
+      // do nothing here; other listeners (e.g., /audio-stream inside setupAudioStream)
+      // will match and handle their own upgrades.
+    }
+  } catch (e) {
+    // If anything goes wrong, make sure to close the socket so it doesn’t hang.
+    try { socket.destroy(); } catch {}
+  }
+});
 
-  // 2) Browser demo mic ↔ Deepgram Agent
-  setupWebDemoLive(server, { route: '/web-demo/ws' });
-  console.log(
-    `[${new Date().toISOString()}] info demo_ws_mounted ${JSON.stringify({
-      route: '/web-demo/ws',
-    })}`
-  );
+console.log(`[${new Date().toISOString()}] info demo_ws_mounted ${JSON.stringify({ route: WEB_DEMO_ROUTE })}`);
 
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(
-      `[${new Date().toISOString()}] info server_listen ${JSON.stringify({
-        url: `http://0.0.0.0:${PORT}`,
-      })}`
-    );
-  });
+/* ---------- listen ---------- */
+const PORT = parseInt(process.env.PORT || '10000', 10);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`[${new Date().toISOString()}] info server_listen ${JSON.stringify({ url: `http://0.0.0.0:${PORT}` })}`);
+});
 
-  // harden process
-  process.on('unhandledRejection', (r) =>
-    console.warn('[warn] unhandledRejection', r?.message || r)
-  );
-  process.on('uncaughtException', (e) =>
-    console.error('[error] uncaughtException', e?.message || e)
-  );
-})();
+/* ---------- harden process ---------- */
+process.on('unhandledRejection', (r) =>
+  console.warn('[warn] unhandledRejection', r?.message || r)
+);
+process.on('uncaughtException', (e) =>
+  console.error('[error] uncaughtException', e?.message || e)
+);

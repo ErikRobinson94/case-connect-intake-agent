@@ -4,7 +4,6 @@
 // Avatar voice is chosen via ?voiceId=1|2|3 -> VOICE_{id}_TTS (fallback DG_TTS_VOICE).
 
 require('dotenv').config();
-const http = require('http');              // adapter creates an HTTP server when started by port
 const WebSocket = require('ws');
 const bus = require('./web-demo-bus');
 
@@ -23,10 +22,8 @@ function compact(s, max = 380) {
   return 'You are the intake specialist. Determine existing client vs accident. If existing: ask full name, best phone, and attorney; then say you will transfer. If accident: collect full name, phone, email, what happened, when, and city/state; confirm all; then say you will transfer. Be warm, concise, and stop speaking if the caller talks.';
 }
 
-// ---------- main implementation (expects an HTTP server) ----------
-function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
-  const wss = new WebSocket.Server({ server, path: route, perMessageDeflate: false });
-
+// ---------- core handler wired to a WSS instance ----------
+function wireWebDemoHandlers(wss) {
   wss.on('connection', (browserWS, req) => {
     let closed = false;
 
@@ -99,7 +96,6 @@ function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
       try {
         agentWS.send(JSON.stringify(settings));
         settingsSent = true;
-        // tell the UI exactly what we applied
         try {
           browserWS.send(JSON.stringify({
             type: 'settings',
@@ -257,26 +253,15 @@ function setupWebDemoLive(server, { route = '/web-demo/ws' } = {}) {
   });
 }
 
-// ---- Adapter so index.js can start this by PORT (preserves your original signature) ----
-function startDemoServer(opts = {}) {
-  const port = Number(opts.port || process.env.DEMO_PORT || 5055);
-  const route = opts.route || '/web-demo/ws';
-
-  const server = http.createServer();
-  setupWebDemoLive(server, { route });
-
-  server.listen(port, '0.0.0.0', () => {
-    console.log(
-      `[${new Date().toISOString()}] info demo_server_listen {"url":"ws://0.0.0.0:${port}${route}"}`
-    );
-  });
+// ---- NEW: create a noServer WSS so index.js can route upgrades safely ----
+function createWebDemoWSS() {
+  // noServer avoids automatic path matching (which was rejecting ?voiceId=2)
+  const wss = new WebSocket.Server({ noServer: true, perMessageDeflate: false });
+  wireWebDemoHandlers(wss);
+  return wss;
 }
 
-/* ===== Exports: support all import styles and keep your original available ===== */
-module.exports = startDemoServer;                  // require('./web-demo-live')({ port })
-module.exports.startDemoServer = startDemoServer;  // require('./web-demo-live').startDemoServer({ port })
-module.exports.default = startDemoServer;          // ESM default
-module.exports.setupWebDemoLive = setupWebDemoLive;// expose original (server, {route})
-
-// Optional: allow `node web-demo-live.js` for quick manual test
-if (require.main === module) startDemoServer();
+/* ===== Exports ===== */
+module.exports = { createWebDemoWSS };
+module.exports.default = { createWebDemoWSS };
+module.exports.setupWebDemoLive = wireWebDemoHandlers; // keep legacy name if someone needs it
