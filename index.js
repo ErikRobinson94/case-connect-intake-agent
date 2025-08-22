@@ -1,5 +1,4 @@
-// index.js — Express + Next + Path-scoped WebSockets + Diagnostics
-// Keeps Twilio /audio-stream, adds /web-demo/ws, /ws-ping, /ws-echo, and /debug page.
+// index.js — Express + Next + Path-scoped WebSockets + Deep Upgrade Logging
 
 require('dotenv').config();
 
@@ -12,10 +11,10 @@ const { createRequire } = require('module');
 const WebSocket = require('ws');
 
 const { handleTwilioCall } = require('./lib/twilioHandler');
-const { setupAudioStream } = require('./lib/audio-stream'); // Twilio path-scoped WS
+const { setupAudioStream } = require('./lib/audio-stream');
 
-// ---------------- Logging ----------------
-const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
+// ---------- Logging ----------
+const LOG_LEVEL = (process.env.LOG_LEVEL || 'debug').toLowerCase();
 const lv = { error:0, warn:1, info:2, debug:3 };
 const log = (level, msg, extra) => {
   if ((lv[level] ?? 2) <= (lv[LOG_LEVEL] ?? 2)) {
@@ -23,17 +22,18 @@ const log = (level, msg, extra) => {
   }
 };
 
-// ---------------- Helpers for demo WS ----------------
+// ---------- Helpers ----------
 const sanitizeASCII = (str) =>
   String(str || '').replace(/[\u0000-\u001f\u007f-\uFFFF]/g, ' ').replace(/\s+/g, ' ').trim();
 
 const compact = (s, max = 380) => {
   const t = (s || '').slice(0, max);
-  return t.length >= 40 ? t :
-    'You are the intake specialist. Determine existing client vs accident. If existing: ask full name, best phone, and attorney; then say you will transfer. If accident: collect full name, phone, email, what happened, when, and city/state; confirm all; then say you will transfer. Be warm, concise, and stop speaking if the caller talks.';
+  return t.length >= 40
+    ? t
+    : 'You are the intake specialist. Determine existing client vs accident. If existing: ask full name, best phone, and attorney; then say you will transfer. If accident: collect full name, phone, email, what happened, when, and city/state; confirm all; then say you will transfer. Be warm, concise, and stop speaking if the caller talks.';
 };
 
-// ---------------- Browser demo WS handler ----------------
+// ---------- Browser demo WS handler ----------
 function handleBrowserDemoWS(browserWS, req) {
   let closed = false;
 
@@ -72,9 +72,7 @@ function handleBrowserDemoWS(browserWS, req) {
     `Thank you for calling ${firm}. Were you in an accident, or are you an existing client?`
   );
 
-  // Wire to Deepgram
   const agentWS = new WebSocket(dgUrl, ['token', dgKey]);
-
   let settingsSent = false;
   let settingsApplied = false;
 
@@ -137,8 +135,7 @@ function handleBrowserDemoWS(browserWS, req) {
 
       switch (evt.type) {
         case 'Welcome':
-          sendSettings();
-          break;
+          sendSettings(); break;
         case 'SettingsApplied':
           settingsApplied = true;
           if (preFrames.length) { try { for (const fr of preFrames) agentWS.send(fr); } catch {} preFrames.length = 0; }
@@ -153,12 +150,12 @@ function handleBrowserDemoWS(browserWS, req) {
         case 'AgentTranscript':
         case 'AgentResponse':
         case 'PartialTranscript':
-        case 'AddPartialTranscript': {
-          if (!text) break;
-          const payload = { type:'transcript', role: (role.includes('agent')||role.includes('assistant'))?'Agent':'User', text, partial: !isFinal };
-          try { browserWS.send(JSON.stringify(payload)); } catch {}
+        case 'AddPartialTranscript':
+          if (text) {
+            const payload = { type:'transcript', role:(role.includes('agent')||role.includes('assistant'))?'Agent':'User', text, partial: !isFinal };
+            try { browserWS.send(JSON.stringify(payload)); } catch {}
+          }
           break;
-        }
         case 'AgentWarning':
           try { browserWS.send(JSON.stringify({ type:'status', text:`Agent warning: ${evt.message || 'unknown'}` })); } catch {}
           break;
@@ -169,7 +166,6 @@ function handleBrowserDemoWS(browserWS, req) {
       }
       return;
     }
-
     // Binary → forward PCM16 to browser
     meterTtsBytes += data.length;
     try { browserWS.send(data, { binary:true }); } catch {}
@@ -195,13 +191,12 @@ function handleBrowserDemoWS(browserWS, req) {
     const buf = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
     meterMicBytes += buf.length;
     micBuf = Buffer.concat([micBuf, buf]);
-
     while (micBuf.length >= BYTES_PER_FRAME) {
       const frame = micBuf.subarray(0, BYTES_PER_FRAME);
       micBuf = micBuf.subarray(BYTES_PER_FRAME);
       if (!settingsSent || !settingsApplied) {
         preFrames.push(frame);
-        if (preFrames.length > MAX_PRE_FRAMES) preFrames.shift();
+        if (preFrames.length > 200) preFrames.shift();
       } else {
         try { agentWS.send(frame); } catch {}
       }
@@ -220,7 +215,7 @@ function handleBrowserDemoWS(browserWS, req) {
   }
 }
 
-// ---------------- Simple WS: ping & echo ----------------
+// ---------- Simple WS: ping & echo ----------
 function handlePingWS(ws) {
   let t = null;
   try { ws.send('pong'); } catch {}
@@ -231,11 +226,8 @@ function handlePingWS(ws) {
   ws.on('message', () => {});
   ws.on('close', () => { if (t) clearInterval(t); });
 }
-
 function handleEchoWS(ws) {
-  ws.on('message', (data, isBinary) => {
-    try { ws.send(data, { binary: isBinary }); } catch {}
-  });
+  ws.on('message', (data, isBinary) => { try { ws.send(data, { binary:isBinary }); } catch {} });
   try { ws.send('echo-ready'); } catch {}
 }
 
@@ -252,150 +244,104 @@ function handleEchoWS(ws) {
   // Twilio webhook
   app.post('/twilio/voice', handleTwilioCall);
 
-  // HTTP server shared by Next + all WS
+  // HTTP server
   const server = http.createServer(app);
 
-  // ---------- WS: Twilio <-> Deepgram (path-scoped) ----------
+  // 🔎 Log EVERY upgrade attempt (non-destructive)
+  server.prependListener('upgrade', (req, _socket, _head) => {
+    try {
+      log('info', 'upgrade_attempt', {
+        url: req.url,
+        host: req.headers.host,
+        connection: req.headers.connection || null,
+        upgrade: req.headers.upgrade || null,
+        sec_ws_key: !!req.headers['sec-websocket-key'],
+        sec_ws_ver: req.headers['sec-websocket-version'] || null,
+        xfp: req.headers['x-forwarded-proto'] || null,
+        cf: !!req.headers['cf-connecting-ip'] || null
+      });
+    } catch {}
+  });
+
+  server.on('clientError', (err, socket) => {
+    log('warn','client_error',{ err: err?.message || String(err) });
+    try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch {}
+  });
+
+  // ---------- WS: Twilio <-> Deepgram ----------
   setupAudioStream(server);
   log('info','audio_ws_mounted',{ route: process.env.AUDIO_STREAM_ROUTE || '/audio-stream' });
 
-  // ---------- WS: Demo (path-scoped) ----------
+  // ---------- WS: Demo ----------
   const DEMO_ROUTE = '/web-demo/ws';
   const demoWSS = new WebSocket.Server({ server, path: DEMO_ROUTE, perMessageDeflate: false });
   demoWSS.on('connection', (ws, req) => { log('info','demo_ws_connection',{ path:req.url }); handleBrowserDemoWS(ws, req); });
   demoWSS.on('headers', (_h, req) => { log('info','demo_ws_handshake',{ path:req.url, ua:req.headers['user-agent'] }); });
+  demoWSS.on('error', (e) => log('warn','demo_ws_error',{ err: e?.message || String(e) }));
   log('info','demo_ws_mounted',{ route: DEMO_ROUTE, mode:'path-scoped' });
 
-  // ---------- WS: Ping (path-scoped) ----------
+  // ---------- WS: Ping ----------
   const PING_ROUTE = '/ws-ping';
   const pingWSS = new WebSocket.Server({ server, path: PING_ROUTE, perMessageDeflate: false });
   pingWSS.on('connection', (ws, req) => { log('info','ping_ws_connection',{ path:req.url }); handlePingWS(ws); });
   pingWSS.on('headers', (_h, req) => { log('info','ping_ws_handshake',{ path:req.url, ua:req.headers['user-agent'] }); });
+  pingWSS.on('error', (e) => log('warn','ping_ws_error',{ err: e?.message || String(e) }));
   log('info','ping_ws_mounted',{ route: PING_ROUTE, mode:'path-scoped' });
 
-  // ---------- WS: Echo (path-scoped) ----------
+  // ---------- WS: Echo ----------
   const ECHO_ROUTE = '/ws-echo';
   const echoWSS = new WebSocket.Server({ server, path: ECHO_ROUTE, perMessageDeflate: false });
   echoWSS.on('connection', (ws, req) => { log('info','echo_ws_connection',{ path:req.url }); handleEchoWS(ws); });
   echoWSS.on('headers', (_h, req) => { log('info','echo_ws_handshake',{ path:req.url, ua:req.headers['user-agent'] }); });
+  echoWSS.on('error', (e) => log('warn','echo_ws_error',{ err: e?.message || String(e) }));
   log('info','echo_ws_mounted',{ route: ECHO_ROUTE, mode:'path-scoped' });
 
-  // ---------- Explicit static for worklets (defensive) ----------
+  // ---------- Explicit static for worklets ----------
   const webDir = path.join(__dirname, 'web');
-  app.use('/worklets', express.static(path.join(webDir, 'public', 'worklets'), {
-    etag: false, maxAge: 0, fallthrough: true
-  }));
+  app.use('/worklets', express.static(path.join(webDir, 'public', 'worklets'), { etag:false, maxAge:0 }));
 
-  // ---------- Minimal /debug page ----------
+  // ---------- /debug page (kept) ----------
   app.get('/debug', (_req, res) => {
-    res.type('html').send(`<!doctype html>
-<html><head><meta charset="utf-8"><title>WS Debug</title>
-<style>
-body{font-family:system-ui,Segoe UI,Arial,sans-serif;background:#0b0b0b;color:#eee;margin:20px}
-h1{font-size:20px} .ok{color:#6ee7b7} .bad{color:#fca5a5} code{background:#111;padding:2px 4px;border-radius:4px}
-.box{border:1px solid #222;padding:12px;border-radius:10px;margin:10px 0;background:#121212}
-small{color:#aaa}
-</style></head><body>
-<h1>CaseConnect /debug</h1>
-<div class="box">
-  <div id="host"></div>
-  <ol id="log"></ol>
-</div>
+    res.type('html').send(`<html><body style="font-family:monospace;color:#eee;background:#111;padding:16px">
+<h3>Debug</h3>
+<p>Open DevTools Console. This page will try WS endpoints:</p>
+<pre id="log"></pre>
 <script>
-(function(){
-  const log = (label, ok, extra) => {
-    const li = document.createElement('li');
-    li.innerHTML = (ok ? '✅ <span class="ok">' : '❌ <span class="bad">') + label + '</span>' + (extra? ' — <small>'+extra+'</small>':'');
-    document.querySelector('#log').appendChild(li);
-  };
-  const host = location.host; const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  document.querySelector('#host').textContent = 'Origin: ' + location.origin;
-
-  // 1) HTTP check
-  fetch('/healthz').then(r=>r.ok?log('HTTP /healthz','ok'):log('HTTP /healthz',false,'status '+r.status)).catch(e=>log('HTTP /healthz',false,String(e)));
-
-  // 2) Worklet fetches
-  fetch('/worklets/pcm-processor.js').then(r=>log('Fetch /worklets/pcm-processor.js',r.ok,'status '+r.status)).catch(e=>log('Fetch /worklets/pcm-processor.js',false,String(e)));
-  fetch('/worklets/pcm-player.js').then(r=>log('Fetch /worklets/pcm-player.js',r.ok,'status '+r.status)).catch(e=>log('Fetch /worklets/pcm-player.js',false,String(e)));
-
-  // 3) AudioWorklet support
-  const AC = window.AudioContext || window.webkitAudioContext;
-  if (!AC) { log('AudioContext available', false, 'no AudioContext'); }
-  else { log('AudioContext available', true); }
-
-  // 4) Mic permissions (will prompt)
-  navigator.mediaDevices?.getUserMedia({audio:true, video:false})
-    .then(()=>log('getUserMedia(audio)',true))
-    .catch(e=>log('getUserMedia(audio)',false,String(e && e.name || e)));
-
-  // 5) WS /ws-echo
-  try {
-    const w1 = new WebSocket(proto+'://'+host+'/ws-echo');
-    w1.onopen = ()=>log('WS /ws-echo open',true);
-    w1.onmessage = (ev)=>{ if (ev.data==='echo-ready') log('WS /ws-echo message',true,'echo-ready'); };
-    w1.onerror = ()=>log('WS /ws-echo error',false);
-    w1.onclose = ()=>{};
-  } catch(e) { log('WS /ws-echo open',false,String(e)); }
-
-  // 6) WS /ws-ping
-  try {
-    const w2 = new WebSocket(proto+'://'+host+'/ws-ping');
-    let got = false;
-    w2.onopen = ()=>log('WS /ws-ping open',true);
-    w2.onmessage = (ev)=>{ if (!got && String(ev.data).toLowerCase()==='pong'){ got=true; log('WS /ws-ping pong',true);} };
-    w2.onerror = ()=>log('WS /ws-ping error',false);
-  } catch(e) { log('WS /ws-ping open',false,String(e)); }
-
-  // 7) WS /web-demo/ws (no Deepgram dependency to open)
-  try {
-    const w3 = new WebSocket(proto+'://'+host+'/web-demo/ws?voiceId=2');
-    w3.onopen = ()=>log('WS /web-demo/ws open',true);
-    w3.onmessage = (ev)=>{ try { const p = JSON.parse(ev.data); if (p && p.type==='status') log('WS /web-demo/ws status',true,p.text); } catch{} };
-    w3.onerror = ()=>log('WS /web-demo/ws error',false);
-  } catch(e) { log('WS /web-demo/ws open',false,String(e)); }
-
-  // 8) Deepgram key present? (server logs already print this at boot)
-  fetch('/healthz').then(()=>log('Deepgram key present (see server logs boot_env)', true));
+const log=(...a)=>{const e=document.getElementById('log');e.textContent+=a.join(' ')+'\\n';console.log(...a)};
+const host=location.host, proto=location.protocol==='https:'?'wss':'ws';
+const t=(p)=>new Promise(r=>setTimeout(r,p));
+(async()=>{
+  try{
+    const e=new WebSocket(proto+'://'+host+'/ws-echo'); e.onopen=()=>log('ws-echo open'); e.onmessage=(m)=>log('ws-echo msg', m.data);
+    const p=new WebSocket(proto+'://'+host+'/ws-ping'); p.onopen=()=>log('ws-ping open'); p.onmessage=(m)=>log('ws-ping', m.data);
+    const d=new WebSocket(proto+'://'+host+'/web-demo/ws?voiceId=2');
+    d.onopen=()=>log('web-demo open');
+    d.onclose=(ev)=>log('web-demo close', ev.code, ev.reason, ev.wasClean);
+    d.onerror=(ev)=>log('web-demo error', ev);
+  }catch(e){ log('err', e); }
 })();
-</script>
-</body></html>`);
+</script></body></html>`);
   });
 
-  // ---------- Next.js from ./web ----------
+  // ---------- Next ----------
   const requireFromWeb = createRequire(path.join(webDir, 'package.json'));
   const next = requireFromWeb('next');
-  const nextApp = next({ dev: false, dir: webDir });
+  const nextApp = next({ dev:false, dir:webDir });
   const nextHandler = nextApp.getRequestHandler();
   await nextApp.prepare();
-
-  // Next handler last
   app.all('*', (req, res) => nextHandler(req, res));
 
-  // ---------- Boot log ----------
-  const mask = (v) => (v ? v.slice(0, 4) + '…' + v.slice(-4) : '');
+  // ---------- Boot ----------
+  const mask = (v)=> (v? v.slice(0,4)+'…'+v.slice(-4):'');
   log('info','boot_env',{
     PORT: process.env.PORT || 10000,
-    AUDIO_STREAM_ROUTE: process.env.AUDIO_STREAM_ROUTE || '/audio-stream',
     DG_AGENT_URL: process.env.DG_AGENT_URL || 'wss://agent.deepgram.com/v1/agent/converse',
-    DG_STT_MODEL: process.env.DG_STT_MODEL || 'nova-2',
-    DG_TTS_VOICE: process.env.DG_TTS_VOICE || 'aura-2-odysseus-en',
-    LLM_MODEL: process.env.LLM_MODEL || 'gpt-4o-mini',
-    LOG_LEVEL: process.env.LOG_LEVEL || 'info',
+    LOG_LEVEL: process.env.LOG_LEVEL || 'debug',
     DEEPGRAM_API_KEY_present: !!process.env.DEEPGRAM_API_KEY,
     OPENAI_API_KEY_present: !!process.env.OPENAI_API_KEY,
-    keys_preview: {
-      DEEPGRAM: mask(process.env.DEEPGRAM_API_KEY || ''),
-      OPENAI: mask(process.env.OPENAI_API_KEY || ''),
-    },
+    keys_preview: { DEEPGRAM: mask(process.env.DEEPGRAM_API_KEY || ''), OPENAI: mask(process.env.OPENAI_API_KEY || '') },
   });
 
   const PORT = parseInt(process.env.PORT, 10) || 10000;
-  server.listen(PORT, '0.0.0.0', () => {
-    log('info','server_listen',{ url: `http://0.0.0.0:${PORT}` });
-  });
-
-  process.on('unhandledRejection', (r) => log('warn','unhandledRejection',{ err: r?.message || r }));
-  process.on('uncaughtException', (e) => log('error','uncaughtException',{ err: e?.message || e }));
+  server.listen(PORT, '0.0.0.0', () => log('info','server_listen',{ url:`http://0.0.0.0:${PORT}` }));
 })();
-
-
