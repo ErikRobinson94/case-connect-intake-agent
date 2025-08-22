@@ -1,3 +1,6 @@
+// index.js (drop-in)
+// Single Render service: Next (from ./web) + WS bridges.
+
 require('dotenv').config();
 
 const path = require('path');
@@ -5,11 +8,9 @@ const http = require('http');
 const express = require('express');
 const morgan = require('morgan');
 const bodyParser = require('body-parser');
+const { createRequire } = require('module');
 
-// Twilio webhook
 const { handleTwilioCall } = require('./lib/twilioHandler');
-
-// Twilio <-> Deepgram bridge (mounts its own WS on /audio-stream)
 let setupAudioStream;
 try {
   ({ setupAudioStream } = require('./lib/audio-stream'));
@@ -17,87 +18,76 @@ try {
   console.error('[error] Failed to load lib/audio-stream.js:', e?.message || e);
 }
 
-// Next.js app (lives in ./web)
-const next = require('next');
-const dev = false;
-const webDir = path.join(__dirname, 'web');
-const nextApp = next({ dev, dir: webDir });
-const handle = nextApp.getRequestHandler();
+(async () => {
+  const app = express();
 
-// Single Express app for everything (Next pages + API)
-const app = express();
-app.use(morgan(process.env.LOG_FORMAT || 'tiny'));
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
+  // Basic middleware
+  app.use(morgan(process.env.LOG_FORMAT || 'tiny'));
+  app.use(bodyParser.urlencoded({ extended: false })); // Twilio sends urlencoded
+  app.use(bodyParser.json());
 
-// Health
-app.get('/', (_req, res) => res.status(200).send('OK'));
-// Twilio webhook
-app.post('/twilio/voice', handleTwilioCall);
+  // Health endpoint for Render
+  app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 
-// Let Next handle everything else (public assets, /app routes, etc.)
-app.all('*', (req, res) => handle(req, res));
+  // Twilio Voice webhook → TwiML that opens the /audio-stream WebSocket
+  app.post('/twilio/voice', handleTwilioCall);
 
-async function start() {
-  await nextApp.prepare();
-
-  // One HTTP server for both HTTP and WebSockets
+  // HTTP server (shared with both WS servers and Next)
   const server = http.createServer(app);
 
-  // Mount Twilio media stream WS (/audio-stream) via your bridge
+  // ----- Mount WS: Twilio <-> Deepgram (exact path; no clashes) -----
   if (typeof setupAudioStream === 'function') {
-    setupAudioStream(server);
+    setupAudioStream(server); // uses process.env.AUDIO_STREAM_ROUTE (default /audio-stream)
   } else {
     console.error(
       '[error] setupAudioStream is not a function. Check lib/audio-stream.js export: module.exports = { setupAudioStream }'
     );
   }
 
-  // ---- Browser demo WS on /web-demo/ws (noServer, manual upgrade) ----
-  const { createWebDemoWSS } = require('./web-demo-live');
-  const demoWSS = createWebDemoWSS();
-  const DEMO_ROUTE = process.env.RENDER_WS_PATH || '/web-demo/ws';
+  // ----- Mount WS: Browser demo (exact path; no clashes) -----
+  try {
+    const demo = require('./web-demo-live');
+    const fn =
+      (demo && typeof demo.setupWebDemoLive === 'function' && demo.setupWebDemoLive) ||
+      (typeof demo === 'function' && demo) ||
+      (demo && typeof demo.default === 'function' && demo.default) ||
+      null;
 
-  console.log(
-    `[${new Date().toISOString()}] info demo_ws_mounted ${JSON.stringify({ route: DEMO_ROUTE })}`
-  );
-
-  server.on('upgrade', (req, socket, head) => {
-    // Only intercept the browser demo path; ignore everything else.
-    let pathname = '';
-    try {
-      pathname = new URL(req.url, 'http://localhost').pathname;
-    } catch { /* ignore */ }
-
-    if (pathname === DEMO_ROUTE) {
-      demoWSS.handleUpgrade(req, socket, head, (ws) => {
-        demoWSS.emit('connection', ws, req);
-      });
-      return;
+    if (fn) {
+      fn(server, { route: '/web-demo/ws' }); // path-scoped
+      console.log(`[${new Date().toISOString()}] info demo_ws_mounted {"route":"/web-demo/ws"}`);
+    } else {
+      console.warn('[warn] web-demo-live export not callable; browser demo WS not mounted.');
     }
+  } catch (err) {
+    console.warn(`[warn] require("./web-demo-live") failed: ${err?.message || err}`);
+  }
 
-    // Do NOT touch other upgrade events; Twilio bridge handles /audio-stream itself.
-  });
+  // ----- Next.js: load from ./web (no root "next" needed) -----
+  const webDir = path.join(__dirname, 'web');
+  const requireFromWeb = createRequire(path.join(webDir, 'package.json'));
+  const next = requireFromWeb('next');
 
-  // Port Render gives your service via env; default to 10000 for local-ish
-  const PORT = parseInt(process.env.PORT || '10000', 10);
+  const nextApp = next({ dev: false, dir: webDir });
+  const nextHandler = nextApp.getRequestHandler();
+
+  await nextApp.prepare();
+
+  // Let Next handle everything else (no hard-coded "/" route here)
+  app.all('*', (req, res) => nextHandler(req, res));
+
+  const PORT = parseInt(process.env.PORT, 10) || 10000;
   server.listen(PORT, '0.0.0.0', () => {
     console.log(
-      `[${new Date().toISOString()}] info server_listen ${JSON.stringify({ url: `http://0.0.0.0:${PORT}` })}`
+      `[${new Date().toISOString()}] info server_listen {"url":"http://0.0.0.0:${PORT}"}`
     );
   });
 
-  // harden process
+  // Harden process
   process.on('unhandledRejection', (r) =>
     console.warn('[warn] unhandledRejection', r?.message || r)
   );
   process.on('uncaughtException', (e) =>
     console.error('[error] uncaughtException', e?.message || e)
   );
-}
-
-start().catch((e) => {
-  console.error('[fatal] boot_failed', e?.message || e);
-  process.exit(1);
-});
-
+})();
