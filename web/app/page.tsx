@@ -164,6 +164,7 @@ export default function Home() {
       const micNode = new AudioWorkletNode(ctx, "pcm-processor"); // emits Int16 @16k, 20ms frames
       micWorkletRef.current = micNode;
 
+      // keep mic graph connected but silent
       const silence = ctx.createGain();
       silence.gain.value = 0;
       micNode.connect(silence).connect(ctx.destination);
@@ -204,9 +205,139 @@ export default function Home() {
   }
 
   return (
-    <main className="min-h-screen w-full px-4 py-10">
-      {/* ... unchanged UI below ... */}
-      {/* Keep your existing JSX from here; omitted for brevity since only WS url changed */}
+    <main className="min-h-screen w-full px-4 py-10 bg-black text-white">
+      <div className="mx-auto w-full max-w-7xl grid grid-cols-1 lg:grid-cols-12 gap-8">
+        {/* LEFT */}
+        <section className="lg:col-span-8">
+          <div className="w-full max-w-[520px] lg:max-w-none rounded-3xl bg-zinc-950/80 border border-zinc-800 p-6 shadow-xl mx-auto">
+            <div className="flex items-center gap-3 justify-center">
+              <svg width="34" height="34" viewBox="0 0 24 24" className="text-teal-400">
+                <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="2" />
+                <path d="M16 8a6 6 0 1 0 0 8" fill="none" stroke="currentColor" strokeWidth="2" />
+              </svg>
+              <div className="text-xl font-semibold tracking-wide">
+                <span className="text-teal-400">CASE</span> <span className="text-white">CONNECT</span>
+              </div>
+            </div>
+
+            <h1 className="mt-6 text-center text-2xl font-bold text-amber-400">
+              Demo our <span className="font-extrabold">AI</span> intake experience
+            </h1>
+            <p className="mt-2 text-center text-sm text-neutral-300">
+              Speak with our virtual assistant and experience a legal intake done right.
+            </p>
+
+            <div className="mt-5 flex justify-center">
+              <button
+                type="button"
+                className="rounded-full bg-amber-500 hover:bg-amber-400 text-black font-medium px-6 py-3 transition"
+                onClick={startDemo}
+              >
+                Speak with AI Assistant
+              </button>
+            </div>
+
+            <div className="my-6 h-px w-full bg-zinc-800" />
+
+            <p className="text-center font-medium text-white">Choose a voice to sample</p>
+            <div className="mt-4 grid grid-cols-3 gap-3">
+              {VOICES.map((v) => {
+                const isSel = selected === v.id;
+                return (
+                  <button
+                    key={v.id}
+                    onClick={() => setSelected(v.id)}
+                    className={[
+                      "group rounded-2xl border bg-zinc-900 p-2 transition",
+                      isSel ? "border-amber-500 ring-2 ring-amber-500/30" : "border-zinc-800",
+                    ].join(" ")}
+                    aria-pressed={isSel}
+                    title={v.name}
+                  >
+                    <div className="relative w-full h-[180px] rounded-xl overflow-hidden bg-black">
+                      <Image
+                        src={v.src}
+                        alt={v.name}
+                        fill
+                        sizes="(max-width: 768px) 100vw, 33vw"
+                        className={["object-contain transition-transform duration-200", v.scale ?? ""].join(" ")}
+                        priority={isSel}
+                        unoptimized
+                      />
+                    </div>
+                    <div className="mt-2 text-center text-xs font-medium">
+                      <span className={isSel ? "text-amber-400" : "text-neutral-300"}>{v.name}</span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </section>
+
+        {/* RIGHT */}
+        <aside className="lg:col-span-4">
+          <div className="rounded-3xl bg-zinc-950/80 border border-zinc-800 shadow-xl h-full flex flex-col">
+            <header className="px-5 py-4 border-b border-zinc-800">
+              <h2 className="text-white font-semibold">Conversation</h2>
+              <p className="text-xs text-neutral-400">
+                {status === "live" ? "Connected." : status === "connecting" ? "Connecting…" : "Live transcript."}
+              </p>
+            </header>
+
+            {/* Scrollable transcript */}
+            <div className="flex-1 px-5 pt-4 space-y-3 overflow-y-auto" style={{ minHeight: 260 }}>
+              {transcript.map((m) => (
+                <div
+                  key={m.id}
+                  className={[
+                    "rounded-2xl px-3 py-2 text-sm w-fit max-w-[90%]",
+                    m.role === "Agent"
+                      ? "bg-zinc-800/60 text-white"
+                      : m.role === "User"
+                      ? "bg-amber-500/90 text-black ml-auto"
+                      : "bg-zinc-700/40 text-neutral-200 mx-auto",
+                  ].join(" ")}
+                >
+                  <span className="font-medium">{m.role}:</span> {m.text}
+                </div>
+              ))}
+
+              {/* live partials */}
+              {partialAgent && (
+                <div className="rounded-2xl px-3 py-2 text-sm w-fit max-w-[90%] bg-zinc-800/40 text-white italic">
+                  <span className="font-medium">Agent:</span> {partialAgent}
+                </div>
+              )}
+              {partialUser && (
+                <div className="rounded-2xl px-3 py-2 text-sm w-fit max-w-[90%] bg-amber-400/70 text-black ml-auto italic">
+                  <span className="font-medium">User:</span> {partialUser}
+                </div>
+              )}
+
+              <div ref={endRef} />
+            </div>
+
+            {/* Footer controls */}
+            <div className="px-5 pb-4 mt-2 border-t border-zinc-800">
+              <div className="flex gap-2">
+                <button
+                  className="w-full rounded-full px-5 py-3 bg-amber-500 text-black text-sm font-medium hover:bg-amber-400 transition"
+                  onClick={startDemo}
+                >
+                  Start
+                </button>
+                <button
+                  className="rounded-full px-5 py-3 border border-zinc-700 text-sm hover:bg-zinc-800 transition"
+                  onClick={stopDemo}
+                >
+                  Stop
+                </button>
+              </div>
+            </div>
+          </div>
+        </aside>
+      </div>
     </main>
   );
 }
