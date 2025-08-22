@@ -3,7 +3,11 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "dev": "node index.js"
+    "dev": "node index.js",
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "@deepgram/sdk": "^3.13.0",
@@ -21,3 +25,5 @@
     "ws": "^8.18.3"
   }
 }
+
+
